@@ -3,7 +3,6 @@ import sys
 import chess.polyglot
 import os
 
-#nuitka tek dosya için
 def getBasePath():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
@@ -92,7 +91,7 @@ PieceValues = {
     chess.QUEEN : 900,
 }
 
-PST = {  # Piece-Square Tables
+PST = {
     chess.PAWN: pawnScore,
     chess.KNIGHT: knightScore,
     chess.BISHOP: bishopScore,
@@ -103,7 +102,7 @@ PST = {  # Piece-Square Tables
 def Puanla(board):
 
     if board.is_checkmate():
-        return -9999999  # side to move kaybetti
+        return -9999999
 
     if board.is_stalemate() or board.is_insufficient_material():
         return 0
@@ -112,19 +111,18 @@ def Puanla(board):
 
     for piece in PieceValues:
 
-        # White taşlar
+        # White
         for square in board.pieces(piece, chess.WHITE):
             score += PieceValues[piece]
             if piece in PST:
                 score += PST[piece][square]
 
-        # Black taşlar
+        # Black
         for square in board.pieces(piece, chess.BLACK):
             score -= PieceValues[piece]
             if piece in PST:
                 score -= PST[piece][chess.square_mirror(square)]
 
-    # Negamax uyumu
     return score if board.turn == chess.WHITE else -score
 
 def negamax(board, depth, alpha, beta):
