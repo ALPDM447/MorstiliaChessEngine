@@ -124,9 +124,33 @@ Morstilia supports the UCI protocol and can be used with GUI programs such as:
   <li>Lucas Chess</li>
 </ul>
 
+<h3>▶️ Option 1: Run with Python</h3>
+
 <p><b>Run from terminal:</b></p>
 
 <pre><code>python Morstilia.py</code></pre>
+
+<h3>▶️ Option 2: Run as Windows Executable (.exe)</h3>
+
+<p>
+If you have compiled the engine as a <code>.exe</code> file (for example using PyInstaller),
+you can directly add the executable to your chess GUI as a UCI engine.
+</p>
+
+<p>
+Steps:
+</p>
+
+<ol>
+  <li>Open your chess GUI (Arena, Cute Chess, etc.)</li>
+  <li>Go to <b>Add New Engine</b></li>
+  <li>Select the <code>Morstilia.exe</code> file</li>
+  <li>Confirm UCI detection</li>
+</ol>
+
+<p>
+The engine will then work like any standard UCI chess engine.
+</p>
 
 <p><b>Example UCI commands:</b></p>
 
