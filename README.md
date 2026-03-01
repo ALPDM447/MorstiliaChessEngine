@@ -124,13 +124,8 @@ Morstilia supports the UCI protocol and can be used with GUI programs such as:
   <li>Lucas Chess</li>
 </ul>
 
-<h3>▶️ Option 1: Run with Python</h3>
 
-<p><b>Run from terminal:</b></p>
-
-<pre><code>python Morstilia.py</code></pre>
-
-<h3>▶️ Option 2: Run as Windows Executable (.exe)</h3>
+<h3>▶️ Option 1: Run as Windows Executable (.exe) (Recommended)</h3>
 
 <p>
 If you have compiled the engine as a <code>.exe</code> file (for example using PyInstaller),
@@ -159,6 +154,12 @@ isready
 position startpos moves e2e4 e7e5
 go
 </code></pre>
+
+<h3>▶️ Option 2: Run with Python</h3>
+
+<p><b>Run from terminal:</b></p>
+
+<pre><code>python Morstilia.py</code></pre>
 
 <hr>
 
