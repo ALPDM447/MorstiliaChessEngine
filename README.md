@@ -1,4 +1,4 @@
-<h1 align="center">♟️ Morstilia V4</h1>
+<h1 align="center">♟️ Morstilia V5</h1>
 
 <p align="center">
   <b>Lightweight UCI-Compatible Chess Engine</b><br>
@@ -17,7 +17,7 @@
 <h2>📌 Overview</h2>
 
 <p>
-Morstilia V4 is a lightweight chess engine built in Python. 
+Morstilia V5 is a lightweight chess engine built in Python. 
 It implements the <b>UCI (Universal Chess Interface)</b> protocol and features 
 a Polyglot opening book, piece-square table evaluation, and a 
 Negamax search algorithm with alpha-beta pruning.
