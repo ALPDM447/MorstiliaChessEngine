@@ -1,0 +1,37 @@
+[package]
+name = "morstilia"
+version = "6.0.0"
+edition = "2024"
+description = "A strong classical UCI chess engine built on shakmaty"
+license = "MIT"
+build = "build.rs"
+
+[dependencies]
+shakmaty = "0.30.1"
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+rayon = "1"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "perft"
+harness = false
+
+[[bench]]
+name = "nps"
+harness = false
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+lto = true
+opt-level = 3
+codegen-units = 1
