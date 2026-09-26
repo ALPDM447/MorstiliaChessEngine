@@ -41,6 +41,8 @@ pub const DEFAULT_BUDGET_MS: u64 = 5_000;
 pub const MIN_PLANNED_MOVES: u32 = 8;
 /// Maximum number of moves we ever plan for.
 pub const MAX_PLANNED_MOVES: u32 = 40;
+/// Clock time held back for sending the move and the GUI's own latency.
+pub const MOVE_OVERHEAD_MS: u64 = 10;
 
 impl TimeLimit {
     /// No time pressure at all (`go infinite`, internal calls, tests).
@@ -122,7 +124,7 @@ pub fn time_limit_from_go(go: &GoParams, pos: &Position) -> TimeLimit {
 /// ```text
 /// moves   = movestogo, or estimate 30 - fullmove/2 (clamped to [8, 40])
 /// budget  = clock / moves + increment
-/// budget  = min(budget, clock / 2)
+/// budget  = min(budget, (clock - overhead) / 2)
 /// ```
 fn clock_budget(go: &GoParams, pos: &Position) -> Option<u64> {
     let (clock, inc) = match pos.turn() {
@@ -139,7 +141,11 @@ fn clock_budget(go: &GoParams, pos: &Position) -> Option<u64> {
     };
 
     let per_move = clock / u64::from(moves) + inc;
-    Some(per_move.min(clock / 2).max(1))
+    Some(
+        per_move
+            .min(clock.saturating_sub(MOVE_OVERHEAD_MS) / 2)
+            .max(1),
+    )
 }
 
 /// Estimates the number of moves remaining from the fullmove counter
@@ -215,7 +221,8 @@ mod tests {
 
     #[test]
     fn clock_budget_never_exceeds_half_the_clock() {
-        // movestogo 1: full clock would go to the next move, but we cap at half.
+        // movestogo 1: full clock would go to the next move, but we cap at half
+        // of what is left after the move overhead.
         let go = GoParams {
             wtime: Some(10_000),
             winc: Some(0),
@@ -223,7 +230,20 @@ mod tests {
             ..GoParams::default()
         };
         let tl = time_limit_from_go(&go, &Position::startpos());
-        assert_eq!(tl.hard_ms, 5_000);
+        assert_eq!(tl.hard_ms, 4_995);
+    }
+
+    #[test]
+    fn a_nearly_empty_clock_keeps_the_move_overhead() {
+        // 20 ms left with a 10 ms increment: half the clock after the
+        // reserve, not the increment the clock can no longer cover.
+        let go = GoParams {
+            wtime: Some(20),
+            winc: Some(10),
+            ..GoParams::default()
+        };
+        let tl = time_limit_from_go(&go, &Position::startpos());
+        assert_eq!(tl.hard_ms, 5);
     }
 
     #[test]

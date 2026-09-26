@@ -300,12 +300,15 @@ impl SearchThread {
     /// one atomic per node, that shared line would serialize the whole node
     /// loop. The exact per-worker total stays in `self.nodes` and is summed
     /// by the runner, so `Threads = 1` reports precisely the same node count
-    /// as before.
+    /// as before. The stop signals are checked every 256 nodes: with NNUE a
+    /// 1024-node gap is over 15 ms, too coarse for bullet clocks.
     #[inline]
     pub fn mark_node(&mut self, shared: &SearchShared) -> bool {
         self.nodes += 1;
-        if self.nodes & 1023 == 0 {
-            shared.nodes.fetch_add(1024, Ordering::Relaxed);
+        if self.nodes & 255 == 0 {
+            if self.nodes & 1023 == 0 {
+                shared.nodes.fetch_add(1024, Ordering::Relaxed);
+            }
             self.refresh_stop(shared);
         }
         self.stopped
