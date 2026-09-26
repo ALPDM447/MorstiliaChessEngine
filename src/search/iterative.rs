@@ -15,7 +15,6 @@ use std::time::Instant;
 use shakmaty::zobrist::Zobrist64;
 
 use crate::board::Position;
-use crate::evaluation::Evaluator;
 use crate::move_ordering::history::MoveCtx;
 use crate::search::{SearchShared, SearchThread};
 use crate::search::{ThreadResult, TimeLimit, alphabeta, is_draw};
@@ -41,7 +40,12 @@ pub fn iterative_search(
 
     thread.hashes[0] = root.hash;
     thread.ctx[0] = None;
-    thread.evals[0] = Evaluator.evaluate(root);
+    // The root is the one node no `make_child` leads to, so its accumulator has
+    // to be built from scratch before anything reads it. No-op in classical mode.
+    if let Some(net) = shared.nnue.as_deref() {
+        thread.refresh_root(root, net);
+    }
+    thread.evals[0] = thread.evaluate_at(root, shared, 0);
     thread.pv_len[0] = 0;
 
     let soft = limits.soft_deadline();
@@ -53,13 +57,15 @@ pub fn iterative_search(
     let mut pv: Vec<RawMove> = Vec::new();
     let mut depth_reached = 0;
 
-    // A helper thread with no assigned root moves has nothing to do.
+    // An empty move list means a `searchmoves` filter excluded everything, or
+    // this is a helper that found no work. Exact local node count is reported
+    // (Lazy SMP workers never read the shared, batched counter).
     if moves.is_empty() {
         return ThreadResult {
             best: RawMove::NULL,
             score: best_score,
             depth: 0,
-            nodes: shared.nodes.load(std::sync::atomic::Ordering::Relaxed),
+            nodes: thread.nodes,
             pv,
             stats: thread.stats,
         };
@@ -74,7 +80,7 @@ pub fn iterative_search(
             best: moves[0],
             score: 0,
             depth: 0,
-            nodes: shared.nodes.load(std::sync::atomic::Ordering::Relaxed),
+            nodes: thread.nodes,
             pv,
             stats: thread.stats,
         };
@@ -118,8 +124,21 @@ pub fn iterative_search(
                 if !fail_low && !fail_high {
                     break (s, m);
                 }
-                if attempts >= 3 || (alpha <= -MATE && beta >= MATE) {
-                    // Give up widening and accept the current bound.
+                // Failed low or high: the result is a bound, not an exact score.
+                // Before widening, check whether we have already exhausted retries
+                // or the window already spans the full range.
+                if attempts >= 3 && !(alpha <= -MATE && beta >= MATE) {
+                    // Aspiration retries exhausted: fall back to a full-window
+                    // re-search to obtain an exact result. A bound must never be
+                    // committed as an exact iterative score.
+                    alpha = -INFINITE;
+                    beta = INFINITE;
+                    attempts += 1;
+                    continue;
+                }
+                if alpha <= -MATE && beta >= MATE {
+                    // Window already full and still failing: accept the bound
+                    // (no further widening is possible).
                     break (s, m);
                 }
                 if fail_low {
@@ -159,7 +178,7 @@ pub fn iterative_search(
         best: best_move,
         score: best_score,
         depth: depth_reached,
-        nodes: shared.nodes.load(std::sync::atomic::Ordering::Relaxed),
+        nodes: thread.nodes,
         pv,
         stats: thread.stats,
     }
@@ -190,7 +209,7 @@ fn root_search_depth(
         if thread.stopped {
             break;
         }
-        let child = root.make_child(m);
+        let child = thread.make_child(root, m, shared, 1);
         thread.ctx[1] = MoveCtx::of(root, m);
 
         let score = if i == 0 {

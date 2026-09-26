@@ -11,21 +11,14 @@
 use shakmaty::{Bitboard, Board, Color, Role, Square, attacks};
 
 use crate::evaluation::Score;
-use crate::evaluation::material::PIECE_VALUES;
+use crate::evaluation::params::EvalParams;
 use crate::evaluation::pawns::PawnInfo;
 
-/// Penalty (mg) for a minor piece attacked by an enemy pawn.
-const WEAK_MINOR: i32 = 15;
-/// Bonus (mg) when our pawn attacks an enemy non-pawn.
-const PAWN_ATTACK_BONUS: i32 = 18;
+/// Safety cap for the space term (±48 cp) — not a tunable weight, just a
+/// guard so a pathological parameter set cannot make space dominate.
+const SPACE_CAP: i32 = 48;
 
-/// Rook on a fully open file / semi-open file.
-const ROOK_OPEN: Score = Score::new(25, 20);
-const ROOK_SEMI_OPEN: Score = Score::new(10, 10);
-/// Rook on the seventh rank.
-const ROOK_SEVENTH: Score = Score::new(20, 40);
-
-pub fn evaluate_threats(board: &Board, info: &PawnInfo) -> Score {
+pub fn evaluate_threats(board: &Board, info: &PawnInfo, p: &EvalParams) -> Score {
     let mut score = Score::zero();
     let occupied = board.occupied();
 
@@ -43,21 +36,22 @@ pub fn evaluate_threats(board: &Board, info: &PawnInfo) -> Score {
 
         // Pawns attacking enemy pieces (non-pawn).
         let pawn_hits = info.pawn_attacks_of(color) & them & !board.by_piece(Role::Pawn.of(!color));
-        mg += PAWN_ATTACK_BONUS * pawn_hits.count() as i32;
+        mg += p.pawn_attack_bonus * pawn_hits.count() as i32;
 
         // Hanging (undefended) enemy pieces hit by our attacks.
         let hanging = them & our_attacks & !their_defended & !board.by_piece(Role::King.of(!color));
         hanging.for_each(|sq| {
             if let Some(piece) = board.piece_at(sq) {
-                mg += PIECE_VALUES[piece.role as usize] * 3 / 40;
+                mg += p.piece_value(piece.role) * 3 / 40;
             }
         });
 
-        // Our minors attacked by enemy pawns.
+        // Our minors attacked by enemy pawns (`weak_minor` is a stored
+        // negative penalty, so adding it subtracts from the score).
         let weak = (board.by_piece(Role::Knight.of(color))
             | board.by_piece(Role::Bishop.of(color)))
             & info.pawn_attacks_of(!color);
-        mg -= WEAK_MINOR * weak.count() as i32;
+        mg += p.weak_minor * weak.count() as i32;
 
         score.mg += sign * mg;
         score.eg += sign * (mg / 2);
@@ -94,13 +88,16 @@ fn total_attacks(
 }
 
 /// Open-file and seventh-rank rewards for rooks.
-pub fn evaluate_rooks(board: &Board, info: &PawnInfo) -> Score {
+pub fn evaluate_rooks(board: &Board, info: &PawnInfo, p: &EvalParams) -> Score {
     let mut score = Score::zero();
     let all_pawns = info.white | info.black;
+    let open = Score::new(p.rook_open[0], p.rook_open[1]);
+    let semi_open = Score::new(p.rook_semi_open[0], p.rook_semi_open[1]);
+    let seventh = Score::new(p.rook_seventh[0], p.rook_seventh[1]);
 
     for color in [Color::White, Color::Black] {
         let sign = if color == Color::White { 1 } else { -1 };
-        let seventh = if color == Color::White { 6u8 } else { 1u8 };
+        let seventh_rank = if color == Color::White { 6u8 } else { 1u8 };
         let enemy_rooks = board.by_piece(Role::Rook.of(!color));
         let mut color_score = Score::zero();
 
@@ -109,15 +106,15 @@ pub fn evaluate_rooks(board: &Board, info: &PawnInfo) -> Score {
             let file_bb = Bitboard(0x0101010101010101u64 << f);
             let pawns_on_file = (all_pawns & file_bb).count();
             if pawns_on_file == 0 {
-                color_score += ROOK_OPEN;
+                color_score += open;
             } else if (info.pawns_of(color) & file_bb).is_empty() {
-                color_score += ROOK_SEMI_OPEN;
+                color_score += semi_open;
             }
 
-            if u8::from(sq.rank()) == seventh
+            if u8::from(sq.rank()) == seventh_rank
                 && (enemy_rooks & Bitboard(0x0101010101010101u64 << f)).is_empty()
             {
-                color_score += ROOK_SEVENTH;
+                color_score += seventh;
             }
         });
 
@@ -130,7 +127,7 @@ pub fn evaluate_rooks(board: &Board, info: &PawnInfo) -> Score {
 /// squares in the enemy camp. The bonus is tapered so it does not dominate
 /// the endgame; the *enemy's* space restricts ours (a pawn pushed on the 4th
 /// that the enemy can hit is not really space).
-pub fn evaluate_space(_board: &Board, info: &PawnInfo) -> Score {
+pub fn evaluate_space(_board: &Board, info: &PawnInfo, p: &EvalParams) -> Score {
     let mut mg = 0i32;
     let mut eg = 0i32;
     for color in [Color::White, Color::Black] {
@@ -149,17 +146,24 @@ pub fn evaluate_space(_board: &Board, info: &PawnInfo) -> Score {
                 }
             }
         });
-        mg += sign * our * 4;
+        mg += sign * our * p.space_mg;
         // Endgame: half weight — space matters less once pieces are traded.
-        eg += sign * our * 2;
+        eg += sign * our * p.space_eg;
     }
-    Score::new(mg.clamp(-48, 48), eg.clamp(-48, 48))
+    Score::new(
+        mg.clamp(-SPACE_CAP, SPACE_CAP),
+        eg.clamp(-SPACE_CAP, SPACE_CAP),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use shakmaty::Position as _;
+
+    fn params() -> EvalParams {
+        EvalParams::default()
+    }
 
     #[test]
     fn hanging_piece_is_bonus() {
@@ -169,7 +173,7 @@ mod tests {
         // Black bishop on b2 is undefended and attacked by the white rook
         // b1 → threat bonus (a rook-vs-rook symmetric pin would cancel out).
         let pi = PawnInfo::scan(&ok);
-        let s = evaluate_threats(&ok, &pi);
+        let s = evaluate_threats(&ok, &pi, &params());
         assert!(
             s.mg > 0,
             "undefended bishop should be a threat bonus: {s:?}"
@@ -184,8 +188,8 @@ mod tests {
         let closed = crate::testutil::chess("6k1/p7/8/8/8/8/p7/R3K3 w - - 0 1")
             .board()
             .clone();
-        let s_open = evaluate_rooks(&open, &PawnInfo::scan(&open));
-        let s_closed = evaluate_rooks(&closed, &PawnInfo::scan(&closed));
+        let s_open = evaluate_rooks(&open, &PawnInfo::scan(&open), &params());
+        let s_closed = evaluate_rooks(&closed, &PawnInfo::scan(&closed), &params());
         assert!(s_open.mg > s_closed.mg);
     }
 
@@ -197,8 +201,25 @@ mod tests {
         let first = crate::testutil::chess("7k/8/8/8/8/8/8/R3K3 w - - 0 1")
             .board()
             .clone();
-        let s_seventh = evaluate_rooks(&seventh, &PawnInfo::scan(&seventh));
-        let s_first = evaluate_rooks(&first, &PawnInfo::scan(&first));
+        let s_seventh = evaluate_rooks(&seventh, &PawnInfo::scan(&seventh), &params());
+        let s_first = evaluate_rooks(&first, &PawnInfo::scan(&first), &params());
         assert!(s_seventh.mg > s_first.mg, "{s_seventh:?} vs {s_first:?}");
+    }
+
+    #[test]
+    fn space_bonus_scales_with_parameter() {
+        // The space term is proportional to the space_mg/space_eg parameters:
+        // doubling the weight must double a non-clamped contribution.
+        let fen = "6k1/8/8/4PP2/3P4/8/8/4K3 w - - 0 1";
+        let board = crate::testutil::chess(fen).board().clone();
+        let pi = PawnInfo::scan(&board);
+        let base = EvalParams::default();
+        let mut doubled = base.clone();
+        doubled.space_mg *= 2;
+        doubled.space_eg *= 2;
+        let s_base = evaluate_space(&board, &pi, &base);
+        let s_double = evaluate_space(&board, &pi, &doubled);
+        assert_eq!(s_double.mg, s_base.mg * 2, "mg scales with space_mg");
+        assert_eq!(s_double.eg, s_base.eg * 2, "eg scales with space_eg");
     }
 }

@@ -18,42 +18,9 @@
 use shakmaty::{Bitboard, Board, Color, Role, Square};
 
 use crate::evaluation::Score;
+use crate::evaluation::params::EvalParams;
 use crate::evaluation::passed_pawns::PassedInfo;
 use crate::evaluation::pawns::{PawnInfo, file_mask, rank_mask};
-
-/// Outpost bonus for a knight (holds its square very well).
-const KNIGHT_OUTPOST: Score = Score::new(30, 20);
-/// Outpost bonus for a bishop (useful but less stable than a knight's).
-const BISHOP_OUTPOST: Score = Score::new(20, 10);
-
-/// Bad-bishop penalty per own pawn on the bishop's colour complex *beyond the
-/// first* (a bishop needs at least some of its own squares free).
-const BAD_BISHOP_PAWN: Score = Score::new(-8, -4);
-/// Cap on how many same-colour pawns can hurt one bishop.
-const BAD_BISHOP_CAP: i32 = 4;
-
-/// Opening-stage gate for the development term (phase ≥ this).
-const DEVELOPMENT_PHASE: i32 = 20;
-/// Penalty (mg) per minor piece still sitting on its home square.
-const UNDEVELOPED: Score = Score::new(-15, 0);
-
-/// Bonus for rooks connected on a clear rank.
-const ROOKS_CONNECTED: Score = Score::new(15, 20);
-/// Bonus for a rook on the same file as a passed pawn, behind it (own passers
-/// are supported from behind, enemy passers are hunted from the far side).
-const ROOK_BEHIND_PASSED: Score = Score::new(10, 30);
-
-/// Bonus for a queen on a well-placed square (mg): a queen behind its own
-/// passed pawn or on an open file is much more useful than one tucked away.
-const QUEEN_BEHIND_PASSED: Score = Score::new(15, 20);
-/// Penalty (mg) for a queen on a square an enemy pawn attacks — a queen that
-/// must dodge pawn fire is a liability.
-const QUEEN_UNDER_PAWN_ATTACK: Score = Score::new(-20, -10);
-
-/// Bonus (mg) for a bishop and knight developed to squares that co-operate
-/// with each other (a bishop on c1 and knight on f3 share the a1-h8 diagonal
-/// influence). Counted per developed minor pair.
-const MINOR_COORDINATION: Score = Score::new(5, 8);
 
 /// Light squares of the board (a1 is dark, so bit 0 is clear).
 const LIGHT_SQUARES: u64 = 0xAA55_AA55_AA55_AA55;
@@ -64,7 +31,14 @@ const WHITE_MINOR_HOME: u64 = (1 << 1) | (1 << 2) | (1 << 5) | (1 << 6); // b1 c
 const BLACK_MINOR_HOME: u64 = WHITE_MINOR_HOME << 56;
 
 /// Evaluates piece activity/coordination for both colors (white minus black).
-pub fn evaluate_pieces(board: &Board, info: &PawnInfo, passed: &PassedInfo, phase: i32) -> Score {
+/// All weights come from `p`; `phase` gates the opening-only development term.
+pub fn evaluate_pieces(
+    board: &Board,
+    info: &PawnInfo,
+    passed: &PassedInfo,
+    phase: i32,
+    p: &EvalParams,
+) -> Score {
     let mut score = Score::zero();
     let occupied = board.occupied();
 
@@ -80,16 +54,17 @@ pub fn evaluate_pieces(board: &Board, info: &PawnInfo, passed: &PassedInfo, phas
         } else {
             rank_mask(1) | rank_mask(2) // ranks 2-3
         };
-        for (role, bonus) in [
-            (Role::Knight, KNIGHT_OUTPOST),
-            (Role::Bishop, BISHOP_OUTPOST),
+        for (role, bonus_arr) in [
+            (Role::Knight, &p.knight_outpost),
+            (Role::Bishop, &p.bishop_outpost),
         ] {
             board.by_piece(role.of(color)).for_each(|sq| {
                 if (info.pawn_attacks_of(color) & Bitboard::from_square(sq)).any()
                     && (enemy_pawn_attacks & Bitboard::from_square(sq)).is_empty()
                     && (Bitboard::from_square(sq) & Bitboard(camp)).any()
                 {
-                    color_score += bonus;
+                    color_score.mg += bonus_arr[0];
+                    color_score.eg += bonus_arr[1];
                 }
             });
         }
@@ -102,12 +77,13 @@ pub fn evaluate_pieces(board: &Board, info: &PawnInfo, passed: &PassedInfo, phas
                 !LIGHT_SQUARES
             };
             let same_colour_pawns = (info.pawns_of(color) & Bitboard(complex)).count() as i32;
-            let excess = (same_colour_pawns - 1).max(0).min(BAD_BISHOP_CAP);
-            color_score += BAD_BISHOP_PAWN * excess;
+            let excess = (same_colour_pawns - 1).max(0).min(p.bad_bishop_cap);
+            color_score.mg += p.bad_bishop_pawn[0] * excess;
+            color_score.eg += p.bad_bishop_pawn[1] * excess;
         });
 
         // --- Development (opening only) -------------------------------------
-        if phase >= DEVELOPMENT_PHASE {
+        if phase >= p.development_phase {
             let home = if color == Color::White {
                 WHITE_MINOR_HOME
             } else {
@@ -116,7 +92,8 @@ pub fn evaluate_pieces(board: &Board, info: &PawnInfo, passed: &PassedInfo, phas
             let minors_home = (board.by_piece(Role::Knight.of(color))
                 | board.by_piece(Role::Bishop.of(color)))
                 & Bitboard(home);
-            color_score += UNDEVELOPED * minors_home.count() as i32;
+            color_score.mg += p.undeveloped[0] * minors_home.count() as i32;
+            color_score.eg += p.undeveloped[1] * minors_home.count() as i32;
         }
 
         // --- Rooks connected ------------------------------------------------
@@ -132,7 +109,8 @@ pub fn evaluate_pieces(board: &Board, info: &PawnInfo, passed: &PassedInfo, phas
                 };
                 let between = between_on_rank(a, b);
                 if (Bitboard(between) & occupied).is_empty() {
-                    color_score += ROOKS_CONNECTED;
+                    color_score.mg += p.rooks_connected[0];
+                    color_score.eg += p.rooks_connected[1];
                 }
             }
         }
@@ -155,7 +133,8 @@ pub fn evaluate_pieces(board: &Board, info: &PawnInfo, passed: &PassedInfo, phas
             let behind_own = !(passed.of(color) & file_bb & Bitboard(own_ahead)).is_empty();
             let behind_enemy = !(passed.of(!color) & file_bb & Bitboard(enemy_ahead)).is_empty();
             if behind_own || behind_enemy {
-                color_score += ROOK_BEHIND_PASSED;
+                color_score.mg += p.rook_behind_passed[0];
+                color_score.eg += p.rook_behind_passed[1];
             }
         });
 
@@ -172,10 +151,12 @@ pub fn evaluate_pieces(board: &Board, info: &PawnInfo, passed: &PassedInfo, phas
                 (below, above)
             };
             if !(passed.of(color) & file_bb & Bitboard(own_ahead)).is_empty() {
-                color_score += QUEEN_BEHIND_PASSED;
+                color_score.mg += p.queen_behind_passed[0];
+                color_score.eg += p.queen_behind_passed[1];
             }
             if (enemy_pawn_attacks & Bitboard::from_square(sq)).any() {
-                color_score += QUEEN_UNDER_PAWN_ATTACK;
+                color_score.mg += p.queen_under_pawn_attack[0];
+                color_score.eg += p.queen_under_pawn_attack[1];
             }
         });
 
@@ -199,7 +180,8 @@ pub fn evaluate_pieces(board: &Board, info: &PawnInfo, passed: &PassedInfo, phas
             let developed_knights = knights & !Bitboard(knight_home);
             let developed_bishops = bishops & !Bitboard(bishop_home);
             if developed_knights.any() && developed_bishops.any() {
-                color_score += MINOR_COORDINATION;
+                color_score.mg += p.minor_coordination[0];
+                color_score.eg += p.minor_coordination[1];
             }
         }
 
@@ -239,7 +221,7 @@ mod tests {
 
     fn score(fen: &str) -> Score {
         let (b, i, p) = parts(fen);
-        evaluate_pieces(&b, &i, &p, 24)
+        evaluate_pieces(&b, &i, &p, 24, &EvalParams::default())
     }
 
     #[test]
@@ -258,8 +240,14 @@ mod tests {
         // not a safe outpost any more.
         let safe = parts("6k1/8/8/4N3/3P4/8/8/4K3 w - - 0 1");
         let hounded = parts("6k1/8/3p4/4N3/3P4/8/8/4K3 w - - 0 1");
-        let s_safe = evaluate_pieces(&safe.0, &safe.1, &safe.2, 24);
-        let s_hound = evaluate_pieces(&hounded.0, &hounded.1, &hounded.2, 24);
+        let s_safe = evaluate_pieces(&safe.0, &safe.1, &safe.2, 24, &EvalParams::default());
+        let s_hound = evaluate_pieces(
+            &hounded.0,
+            &hounded.1,
+            &hounded.2,
+            24,
+            &EvalParams::default(),
+        );
         assert!(s_safe.mg > s_hound.mg, "{s_safe:?} vs {s_hound:?}");
     }
 
@@ -270,8 +258,20 @@ mod tests {
         // term must drop.
         let supported = parts("6k1/8/8/4N3/3P4/8/8/4K3 w - - 0 1");
         let unsupported = parts("6k1/8/8/4N3/8/8/8/4K3 w - - 0 1");
-        let s_sup = evaluate_pieces(&supported.0, &supported.1, &supported.2, 24);
-        let s_unsup = evaluate_pieces(&unsupported.0, &unsupported.1, &unsupported.2, 24);
+        let s_sup = evaluate_pieces(
+            &supported.0,
+            &supported.1,
+            &supported.2,
+            24,
+            &EvalParams::default(),
+        );
+        let s_unsup = evaluate_pieces(
+            &unsupported.0,
+            &unsupported.1,
+            &unsupported.2,
+            24,
+            &EvalParams::default(),
+        );
         assert!(s_sup.mg > s_unsup.mg, "{s_sup:?} vs {s_unsup:?}");
     }
 
@@ -284,13 +284,16 @@ mod tests {
         // difference is exactly the bad-bishop penalty.
         let bad = parts("6k1/8/8/8/8/8/P1P1P1P1/4K1B1 w - - 0 1"); // a2 c2 e2 g2 (light)
         let ok = parts("6k1/8/8/8/8/8/1P1P1P1P/4K1B1 w - - 0 1"); // b2 d2 f2 h2 (dark)
-        let s_bad = evaluate_pieces(&bad.0, &bad.1, &bad.2, 24);
-        let s_good = evaluate_pieces(&ok.0, &ok.1, &ok.2, 24);
+        let s_bad = evaluate_pieces(&bad.0, &bad.1, &bad.2, 24, &EvalParams::default());
+        let s_good = evaluate_pieces(&ok.0, &ok.1, &ok.2, 24, &EvalParams::default());
         assert!(
             s_bad.mg < s_good.mg,
             "light-square pawns hurt the f1 bishop: {s_bad:?} vs {s_good:?}"
         );
-        assert_eq!(s_bad.mg - s_good.mg, BAD_BISHOP_PAWN.mg * 3);
+        assert_eq!(
+            s_bad.mg - s_good.mg,
+            EvalParams::default().bad_bishop_pawn[0] * 3
+        );
     }
 
     #[test]
@@ -299,8 +302,8 @@ mod tests {
         // the other has it on c3 (developed).
         let lazy = parts("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
         let dev = parts("rnbqkbnr/pppppppp/8/8/8/2N5/PPPPPPPP/R1BQKBNR w KQkq - 0 1");
-        let s_lazy = evaluate_pieces(&lazy.0, &lazy.1, &lazy.2, 24);
-        let s_dev = evaluate_pieces(&dev.0, &dev.1, &dev.2, 24);
+        let s_lazy = evaluate_pieces(&lazy.0, &lazy.1, &lazy.2, 24, &EvalParams::default());
+        let s_dev = evaluate_pieces(&dev.0, &dev.1, &dev.2, 24, &EvalParams::default());
         assert!(
             s_dev.mg > s_lazy.mg,
             "developing the knight must improve the piece term: {} vs {}",
@@ -309,7 +312,7 @@ mod tests {
         );
         // In a pure endgame (phase 0) the term must be silent.
         let eg = parts("6k1/8/8/8/8/8/8/4KN2 w - - 0 1");
-        let s_eg = evaluate_pieces(&eg.0, &eg.1, &eg.2, 0);
+        let s_eg = evaluate_pieces(&eg.0, &eg.1, &eg.2, 0, &EvalParams::default());
         assert_eq!(s_eg.mg, 0, "development is an opening term only");
     }
 
@@ -319,12 +322,24 @@ mod tests {
         // moved away); a1 + h1 have pieces between by default.
         let connected = parts("6k1/8/8/8/8/8/8/RR2K3 w - - 0 1");
         let separated = parts("6k1/8/8/8/8/8/8/R3K2R w - - 0 1");
-        let s_con = evaluate_pieces(&connected.0, &connected.1, &connected.2, 24);
-        let s_sep = evaluate_pieces(&separated.0, &separated.1, &separated.2, 24);
+        let s_con = evaluate_pieces(
+            &connected.0,
+            &connected.1,
+            &connected.2,
+            24,
+            &EvalParams::default(),
+        );
+        let s_sep = evaluate_pieces(
+            &separated.0,
+            &separated.1,
+            &separated.2,
+            24,
+            &EvalParams::default(),
+        );
         assert!(s_con.mg > s_sep.mg, "{s_con:?} vs {s_sep:?}");
         assert_eq!(
             s_con.mg - s_sep.mg,
-            ROOKS_CONNECTED.mg,
+            EvalParams::default().rooks_connected[0],
             "exactly the connected-rook bonus"
         );
     }
@@ -334,18 +349,18 @@ mod tests {
         // White rook d1 behind its own d5 passer vs a rook on a1.
         let behind = parts("6k1/8/8/3P4/8/8/8/3R2K1 w - - 0 1");
         let idle = parts("6k1/8/8/3P4/8/8/8/R3K3 w - - 0 1");
-        let s_behind = evaluate_pieces(&behind.0, &behind.1, &behind.2, 24);
-        let s_idle = evaluate_pieces(&idle.0, &idle.1, &idle.2, 24);
+        let s_behind = evaluate_pieces(&behind.0, &behind.1, &behind.2, 24, &EvalParams::default());
+        let s_idle = evaluate_pieces(&idle.0, &idle.1, &idle.2, 24, &EvalParams::default());
         assert!(s_behind.mg > s_idle.mg, "{s_behind:?} vs {s_idle:?}");
         assert_eq!(
             s_behind.mg - s_idle.mg,
-            ROOK_BEHIND_PASSED.mg,
+            EvalParams::default().rook_behind_passed[0],
             "exactly the behind-passer bonus"
         );
 
         // And behind an *enemy* passer (white rook on d8 chasing black's d5).
         let chase = parts("6k1/3R4/8/3p4/8/8/8/4K3 w - - 0 1");
-        let s_chase = evaluate_pieces(&chase.0, &chase.1, &chase.2, 24);
+        let s_chase = evaluate_pieces(&chase.0, &chase.1, &chase.2, 24, &EvalParams::default());
         assert!(
             s_chase.mg > s_idle.mg,
             "a rook behind the enemy passer is also worth a bonus"
@@ -358,7 +373,7 @@ mod tests {
         // outpost, bad-bishop, development, connected-rook or behind-passer
         // term — the component must be exactly zero.
         let pos = parts("7k/5Q2/8/8/8/8/8/4K3 w - - 0 1");
-        let s = evaluate_pieces(&pos.0, &pos.1, &pos.2, 24);
+        let s = evaluate_pieces(&pos.0, &pos.1, &pos.2, 24, &EvalParams::default());
         assert_eq!(s.mg, 0);
         assert_eq!(s.eg, 0);
     }
@@ -368,12 +383,12 @@ mod tests {
         // White queen on d1 behind its own d5 passer vs a queen on a1.
         let behind = parts("6k1/8/8/3P4/8/8/8/3Q2K1 w - - 0 1");
         let idle = parts("6k1/8/8/3P4/8/8/8/Q3K3 w - - 0 1");
-        let s_behind = evaluate_pieces(&behind.0, &behind.1, &behind.2, 24);
-        let s_idle = evaluate_pieces(&idle.0, &idle.1, &idle.2, 24);
+        let s_behind = evaluate_pieces(&behind.0, &behind.1, &behind.2, 24, &EvalParams::default());
+        let s_idle = evaluate_pieces(&idle.0, &idle.1, &idle.2, 24, &EvalParams::default());
         assert!(s_behind.mg > s_idle.mg, "{s_behind:?} vs {s_idle:?}");
         assert_eq!(
             s_behind.mg - s_idle.mg,
-            QUEEN_BEHIND_PASSED.mg,
+            EvalParams::default().queen_behind_passed[0],
             "exactly the behind-passer bonus"
         );
     }
@@ -384,12 +399,18 @@ mod tests {
         // on e5 with no attacking pawn.
         let safe = parts("6k1/8/8/4Q3/8/8/8/4K3 w - - 0 1");
         let hounded = parts("6k1/8/3p4/4Q3/8/8/8/4K3 w - - 0 1");
-        let s_safe = evaluate_pieces(&safe.0, &safe.1, &safe.2, 24);
-        let s_hound = evaluate_pieces(&hounded.0, &hounded.1, &hounded.2, 24);
+        let s_safe = evaluate_pieces(&safe.0, &safe.1, &safe.2, 24, &EvalParams::default());
+        let s_hound = evaluate_pieces(
+            &hounded.0,
+            &hounded.1,
+            &hounded.2,
+            24,
+            &EvalParams::default(),
+        );
         assert!(s_safe.mg > s_hound.mg, "{s_safe:?} vs {s_hound:?}");
         assert_eq!(
             s_safe.mg - s_hound.mg,
-            -QUEEN_UNDER_PAWN_ATTACK.mg,
+            -EvalParams::default().queen_under_pawn_attack[0],
             "exactly the queen-under-pawn penalty"
         );
     }
@@ -400,8 +421,14 @@ mod tests {
         // pieces still on their home squares (startpos).
         let developed = parts("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/2B2N2/PPPP1PPP/R2Q1RK1 w kq - 0 1");
         let home = parts("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-        let s_dev = evaluate_pieces(&developed.0, &developed.1, &developed.2, 24);
-        let s_home = evaluate_pieces(&home.0, &home.1, &home.2, 24);
+        let s_dev = evaluate_pieces(
+            &developed.0,
+            &developed.1,
+            &developed.2,
+            24,
+            &EvalParams::default(),
+        );
+        let s_home = evaluate_pieces(&home.0, &home.1, &home.2, 24, &EvalParams::default());
         assert!(s_dev.mg > s_home.mg, "{s_dev:?} vs {s_home:?}");
     }
 }

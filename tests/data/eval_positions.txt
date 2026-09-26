@@ -1,0 +1,17 @@
+# Morstilia sample evaluation dataset (Stage 5 — dataset pipeline).
+#
+# Format: one `result FEN` or `FEN result` per line; `#` starts a comment.
+# Results are target scores in [0, 1] (or PGN: 1-0, 0-1, 1/2-1/2).
+# Used by tests/stage5.rs; the same loader serves `tune --data FILE`.
+
+# --- result-first form ----------------------------------------------------
+0.5 rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
+1 8/8/8/8/8/2k5/3R4/2K5 w - - 0 1
+0 8/8/8/8/8/2k5/2r5/2K5 w - - 0 1
+0.5 r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1
+0.75 r2q1rk1/1p2bppp/p2pbn2/4p3/4P3/1PN1BP2/PQPP2PP/R3KB1R w KQ - 0 1
+
+# --- FEN-first form -------------------------------------------------------
+8/8/8/8/8/2k5/2P5/2K5 w - - 0 1 1.0
+4k3/8/8/8/8/8/4P3/4K3 w - - 0 1 0.5
+8/8/8/8/8/2k5/3R4/2K5 w - - 0 1 1-0

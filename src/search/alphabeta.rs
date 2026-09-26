@@ -24,7 +24,6 @@
 use shakmaty::zobrist::Zobrist64;
 
 use crate::board::Position;
-use crate::evaluation::Evaluator;
 use crate::move_ordering::history::MoveCtx;
 use crate::move_ordering::{is_capture_or_promotion, moving_role, order_moves_ctx, see};
 use crate::search::pruning;
@@ -74,7 +73,7 @@ pub fn alphabeta(
     }
 
     if ply >= MAX_PLY - 1 {
-        return Evaluator.evaluate(pos);
+        return thread.evaluate_at(pos, shared, ply);
     }
     if depth <= 0 {
         return qsearch::qsearch(pos, alpha, beta, ply, shared, thread, history);
@@ -115,7 +114,7 @@ pub fn alphabeta(
         return 0;
     }
 
-    let static_eval = Evaluator.evaluate(pos);
+    let static_eval = thread.evaluate_at(pos, shared, ply);
     thread.evals[ply] = static_eval;
     thread.hashes[ply] = pos.hash;
 
@@ -142,6 +141,8 @@ pub fn alphabeta(
         && static_eval + pruning::razor_margin(depth) < alpha
     {
         thread.stats.razor_attempts += 1;
+        // Same position, same ply: the accumulator slot for `ply` is still
+        // valid, so quiescence reuses it.
         let razor_score = qsearch::qsearch(pos, alpha, beta, ply, shared, thread, history);
         if razor_score <= alpha {
             thread.stats.razor_cutoffs += 1;
@@ -163,9 +164,12 @@ pub fn alphabeta(
         && static_eval >= beta
         && pruning::side_has_attacking_pieces(pos.board(), pos.turn())
     {
-        if let Some(nulled) = pos.null_move() {
+        if pos.null_move().is_some() {
             thread.stats.null_probes += 1;
             thread.ctx[ply + 1] = None;
+            // Passing changes nothing on the board, so the child's accumulator
+            // is the parent's — a copy, not a refresh.
+            let nulled = thread.make_child_null(pos, shared, ply + 1);
             let null_score = -alphabeta(
                 &nulled,
                 -beta,
@@ -207,6 +211,8 @@ pub fn alphabeta(
         && pruning::side_has_attacking_pieces(pos.board(), pos.turn())
     {
         thread.stats.probcut_attempts += 1;
+        // Re-entering at the *same* position and ply: slot `ply` still describes
+        // `pos`, so the proof search needs no accumulator update at all.
         let prob_score = alphabeta(
             pos,
             beta - 1,
@@ -229,7 +235,16 @@ pub fn alphabeta(
 
     let prev = thread.ctx[ply];
     let ant = thread.ctx[ply.saturating_sub(1)];
-    order_moves_ctx(&mut moves, pos, &thread.tables, tt_move, ply, prev, ant);
+    order_moves_ctx(
+        &mut moves,
+        pos,
+        &thread.tables,
+        tt_move,
+        ply,
+        prev,
+        ant,
+        &shared.params,
+    );
 
     let mut best = -INFINITE;
     let mut best_move = RawMove::NULL;
@@ -264,7 +279,7 @@ pub fn alphabeta(
         // SEE pruning: hopeless captures are skipped outright.
         if !pv_node && !in_check && is_tactical {
             thread.stats.see_calls += 1;
-            let see_v = see::see(pos.board(), m);
+            let see_v = see::see(pos.board(), m, &shared.params);
             if see_v < pruning::see_prune_threshold(depth) {
                 thread.stats.see_pruned += 1;
                 continue;
@@ -284,7 +299,7 @@ pub fn alphabeta(
         }
 
         // --- Search the move ---
-        let child = pos.make_child(m);
+        let child = thread.make_child(pos, m, shared, ply + 1);
         thread.ctx[ply + 1] = MoveCtx::of(pos, m);
 
         // Check extension: a move that gives check is searched one ply deeper,
@@ -508,6 +523,7 @@ fn history_bonus(depth: Depth) -> i32 {
 mod tests {
     use super::*;
     use crate::board::Position;
+    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
     /// Runs a single fixed-depth search from a FEN.
@@ -523,7 +539,7 @@ mod tests {
             hard_ms: 0,
             infinite: true,
         };
-        searcher.search(&pos, &[], &limits, &stop, 1, &[])
+        searcher.search(&pos, &[], &limits, &Arc::new(stop), 1, &[])
     }
 
     #[test]
@@ -592,7 +608,7 @@ mod tests {
             hard_ms: 0,
             infinite: true,
         };
-        searcher.search(&pos, &[], &limits, &stop, 1, &[])
+        searcher.search(&pos, &[], &limits, &Arc::new(stop), 1, &[])
     }
 
     #[test]
@@ -704,7 +720,7 @@ mod tests {
             hard_ms: 0,
             infinite: true,
         };
-        let r = searcher.search(&pos, &[], &limits, &stop, 1, &[]);
+        let r = searcher.search(&pos, &[], &limits, &Arc::new(stop), 1, &[]);
         assert!(r.stopped, "search must report the pre-requested abort");
         let stores = searcher.tt.stores();
         assert_eq!(stores, r.tt_stores, "harvested counter must match the TT");
@@ -752,7 +768,7 @@ mod tests {
                 hard_ms: 0,
                 infinite: true,
             };
-            searcher.search(&pos, &[], &limits, &stop, 1, &[])
+            searcher.search(&pos, &[], &limits, &Arc::new(stop), 1, &[])
         };
         let a = run(50_000);
         assert!(a.stopped, "the node cap must abort the search");

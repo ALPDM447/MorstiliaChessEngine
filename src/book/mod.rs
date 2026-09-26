@@ -1071,4 +1071,148 @@ mod tests {
         // The ep file (d=3 → index 772+3) must be XORed in.
         assert_eq!(key ^ POLYGLOT_RANDOM_ARRAY[775], without_ep);
     }
+
+    // --- PolyglotBook::load / selection --------------------------------------
+
+    /// A unique scratch dir per test (parallel test binaries may share
+    /// `temp_dir`, so include the process id and a counter).
+    fn scratch_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "morstilia_book_test_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    /// Encodes one 16-byte Polyglot entry (promo 0 = none, 1 = Q … 4 = N).
+    fn encode(key: u64, from: u32, to: u32, promo: u32, weight: u16) -> [u8; 16] {
+        let raw = (from << 6) | to | (promo << 12);
+        let mut b = [0u8; 16];
+        b[0..8].copy_from_slice(&key.to_be_bytes());
+        b[8..10].copy_from_slice(&(raw as u16).to_be_bytes());
+        b[10..12].copy_from_slice(&weight.to_be_bytes());
+        b[12..16].copy_from_slice(&0u32.to_be_bytes());
+        b
+    }
+
+    /// Writes `chunks` (each a full 16-byte entry) to `dir/book.bin` and
+    /// returns the path.
+    fn write_book(dir: &std::path::Path, chunks: &[[u8; 16]]) -> std::path::PathBuf {
+        let path = dir.join("book.bin");
+        let mut bytes = Vec::with_capacity(chunks.len() * 16);
+        for c in chunks {
+            bytes.extend_from_slice(c);
+        }
+        std::fs::write(&path, &bytes).expect("write book file");
+        path
+    }
+
+    const STARTPOS_KEY: u64 = 0x463b96181691fc9c;
+    // squares: e2=12, e4=28, e5=36, g1=6, f3=21, b1=1, c3=18
+    const E2: u32 = 12;
+    const E4: u32 = 28;
+    const E5: u32 = 36;
+    const G1: u32 = 6;
+    const F3: u32 = 21;
+    const B1: u32 = 1;
+    const C3: u32 = 18;
+
+    #[test]
+    fn load_rejects_missing_and_corrupt_books_gracefully() {
+        let dir = scratch_dir();
+        // Missing file → Err.
+        assert!(PolyglotBook::load(&dir.join("nope.bin")).is_err());
+        // A non-multiple-of-16 payload is corrupt → Err.
+        std::fs::write(dir.join("bad.bin"), [0u8; 15]).unwrap();
+        assert!(PolyglotBook::load(&dir.join("bad.bin")).is_err());
+        // An empty file is not corrupt: zero entries, still loadable (the UCI
+        // layer drops empty books silently).
+        let empty = write_book(&dir, &[]);
+        let book = PolyglotBook::load(&empty).expect("empty book loads");
+        assert_eq!(book.len(), 0);
+        assert!(book.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn best_move_filters_illegal_moves() {
+        let dir = scratch_dir();
+        // e2e5 (weight 5) is an illegal three-square pawn push; e2e4 (weight
+        // 3) is legal. The illegal entry must be skipped even though it has
+        // the higher weight.
+        let path = write_book(
+            &dir,
+            &[
+                encode(STARTPOS_KEY, E2, E5, 0, 5),
+                encode(STARTPOS_KEY, E2, E4, 0, 3),
+            ],
+        );
+        let book = PolyglotBook::load(&path).unwrap();
+        let pos = Position::startpos();
+        let mov = RawMove::new(Square::new(E2), Square::new(E4), RawMove::NORMAL);
+        assert_eq!(book.best_move(&pos), Some(mov));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn best_move_returns_none_when_every_entry_is_illegal() {
+        let dir = scratch_dir();
+        let path = write_book(&dir, &[encode(STARTPOS_KEY, E2, E5, 0, 5)]);
+        let book = PolyglotBook::load(&path).unwrap();
+        assert_eq!(book.best_move(&Position::startpos()), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn weighted_move_is_seeded_deterministic_and_legal() {
+        let dir = scratch_dir();
+        let path = write_book(
+            &dir,
+            &[
+                encode(STARTPOS_KEY, E2, E4, 0, 2),
+                encode(STARTPOS_KEY, G1, F3, 0, 1),
+                encode(STARTPOS_KEY, B1, C3, 0, 1),
+            ],
+        );
+        let book = PolyglotBook::load(&path).unwrap();
+        let pos = Position::startpos();
+        let legal: Vec<RawMove> = pos.legal_moves().iter().collect();
+        let mv = |f: u32, t: u32| RawMove::new(Square::new(f), Square::new(t), RawMove::NORMAL);
+        let candidates = [mv(E2, E4), mv(G1, F3), mv(B1, C3)];
+
+        // Same seed → the entire 2000-draw sequence is identical.
+        let mut r1 = SplitMix64(0xdead_beef_dead_beef);
+        let mut r2 = SplitMix64(0xdead_beef_dead_beef);
+        let seq1: Vec<RawMove> = (0..2000)
+            .map(|_| book.weighted_move(&pos, &mut || r1.next()).unwrap())
+            .collect();
+        let seq2: Vec<RawMove> = (0..2000)
+            .map(|_| book.weighted_move(&pos, &mut || r2.next()).unwrap())
+            .collect();
+        assert_eq!(seq1, seq2, "a seeded rng must reproduce the book sequence");
+
+        // Every draw is legal and comes from the candidate set.
+        for m in &seq1 {
+            assert!(legal.contains(m), "book move must be legal: {}", m.to_uci());
+            assert!(
+                candidates.contains(m),
+                "unexpected book move: {}",
+                m.to_uci()
+            );
+        }
+
+        // The 2:1:1 weighting must show: e2e4 is chosen more often than a
+        // minority line (deterministic for a fixed seed, so never flaky).
+        let heavy = seq1.iter().filter(|m| **m == mv(E2, E4)).count();
+        let light = seq1.iter().filter(|m| **m == mv(G1, F3)).count();
+        assert!(
+            heavy > light,
+            "weighted selection: {heavy} e2e4 vs {light} g1f3"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

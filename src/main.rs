@@ -5,31 +5,46 @@
 //! scripted use:
 //!
 //! * `--perft <depth> [--fen <fen>]` — grouped perft node counts.
-//! * `--fen <fen> --depth N [--threads N] [--hash MB]` — one-shot positional
-//!   search; prints the same `info ...` / `bestmove ...` lines UCI would.
-//! * `--bench [--depth N] [--threads N] [--hash MB]` — a fixed position suite
-//!   with per-position node counts and an aggregate NPS figure.
+//! * `--fen <fen> --depth N [--threads N] [--hash MB] [--eval ...] [--nnue ...]` —
+//!   one-shot positional search; prints the same `info ...` / `bestmove ...`
+//!   lines UCI would.
+//! * `--bench [--depth N] [--threads N] [--hash MB] [--eval ...] [--nnue ...]` —
+//!   a fixed position suite with per-position node counts and an aggregate NPS
+//!   figure.
 //! * `--version`, `--help`.
 //!
 //! Arguments take the `--name value` or `--name=value` form.
 
 use std::io::BufRead;
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
 
 use morstilia::board::Position;
-use morstilia::config::{DEFAULT_HASH_MB, DEFAULT_THREADS};
+use morstilia::config::{DEFAULT_HASH_MB, DEFAULT_THREADS, EvalMode};
+use morstilia::evaluation::{EvalParams, Evaluator};
+use morstilia::nnue;
+use morstilia::nnue::network::Network;
 use morstilia::uci::UciEngine;
 
 const USAGE: &str = "\
-Morstilia — a strong classical UCI chess engine.
+Morstilia — a UCI chess engine with a classical and an NNUE evaluator.
 
 Usage:
   morstilia [--mode uci]                 UCI loop over stdin (default)
   morstilia --perft <depth> [--fen FEN]  perft node counts
-  morstilia --fen FEN --depth N [--threads N] [--hash MB]   one-shot search
-  morstilia --bench [--depth N] [--threads N] [--hash MB] [--stats]   fixed benchmark
+  morstilia --fen FEN --depth N [--threads N] [--hash MB] [--eval-params FILE] [--syzygy DIR] [--eval classical|nnue] [--nnue FILE]   one-shot search
+  morstilia --bench [--depth N] [--threads N] [--hash MB] [--eval-params FILE] [--syzygy DIR] [--eval classical|nnue] [--nnue FILE] [--stats]   fixed benchmark
+  morstilia --evaluate FEN [--eval-params FILE]   per-component classical evaluation breakdown
+  morstilia --export-params FILE          write the baseline eval params as TOML
   morstilia --version                    print engine identity
+
+Evaluators:
+  --eval classical   the hand-written evaluation (default; always available)
+  --eval nnue        the Stockfish 19 net in nnue/nn-1a298aa575a0.nnue
+  --nnue FILE        use a different .nnue net. Unlike over UCI, a broken or
+                     missing net is a hard error here: an explicit --eval nnue
+                     on the command line must not silently run something else.
 ";
 
 fn main() {
@@ -64,6 +79,8 @@ fn run(args: &[String]) -> anyhow::Result<()> {
         Some("--perft") => cmd_perft(args, i),
         Some("--fen") => cmd_search(args, i),
         Some("--bench") => cmd_bench(args, i),
+        Some("--evaluate") => cmd_evaluate(args, i),
+        Some("--export-params") => cmd_export_params(args, i),
         Some(other) => bail!("unknown argument: {other}"),
     }
 }
@@ -133,6 +150,10 @@ fn cmd_search(args: &[String], i: usize) -> anyhow::Result<()> {
     let mut depth = DEFAULT_BENCH_DEPTH;
     let mut threads = DEFAULT_THREADS;
     let mut hash = DEFAULT_HASH_MB;
+    let mut params_path: Option<String> = None;
+    let mut syzygy: Option<String> = None;
+    let mut eval = EvalMode::Classical;
+    let mut net_path: Option<String> = None;
     while j < args.len() {
         let flag = args[j].clone();
         match flag_value(args, &mut j, &flag) {
@@ -145,19 +166,79 @@ fn cmd_search(args: &[String], i: usize) -> anyhow::Result<()> {
             Some(v) if flag == "--hash" => {
                 hash = v.parse().context("--hash must be an integer (MB)")?
             }
+            Some(v) if flag == "--eval-params" => params_path = Some(v),
+            Some(v) if flag == "--syzygy" => syzygy = Some(v),
+            Some(v) if flag == "--eval" => {
+                eval = EvalMode::parse(&v)
+                    .with_context(|| format!("--eval must be classical or nnue, got {v:?}"))?
+            }
+            Some(v) if flag == "--nnue" => net_path = Some(v),
             _ => bail!("unexpected argument: {flag}"),
         }
     }
-    let out = search_once(fen, depth, threads, hash)?;
+    let params = load_params(params_path.as_deref())?;
+    let nnue = load_cli_nnue(eval, net_path.as_deref())?;
+    let out = search_once(
+        fen,
+        depth,
+        threads,
+        hash,
+        &params,
+        syzygy.as_deref(),
+        nnue.as_ref(),
+    )?;
     print!("{out}");
     Ok(())
+}
+
+/// Loads the NNUE net for a one-shot CLI command, or `None` in classical mode.
+///
+/// Unlike the UCI layer this is *fatal*. A GUI that asks for `Eval nnue` and
+/// gets classical evaluation back has a broken install and keeps playing; a
+/// user who typed `--eval nnue` on a command line and sees classical scores
+/// would have no way to tell. So a missing, truncated or incompatible net is an
+/// error here, and `--eval` defaults to classical so the net is never loaded
+/// unless it was asked for.
+fn load_cli_nnue(mode: EvalMode, path: Option<&str>) -> anyhow::Result<Option<Arc<Network>>> {
+    if mode != EvalMode::Nnue {
+        return Ok(None);
+    }
+    if let Some(explicit_path) = path {
+        // Explicit --nnue FILE given: load that file (fatal if missing/corrupt)
+        let path = nnue::resolve_net_path(explicit_path);
+        let net = nnue::load_network(&path)
+            .with_context(|| format!("cannot use the NNUE net at {}", path.display()))?;
+        eprintln!(
+            "morstilia: nnue: loaded {} (network hash {:#010x})",
+            path.display(),
+            nnue::NETWORK_HASH
+        );
+        Ok(Some(Arc::new(net)))
+    } else {
+        // No explicit file: use the embedded default network
+        let net =
+            nnue::load_embedded_network().context("embedded default network failed validation")?;
+        eprintln!(
+            "morstilia: nnue: loaded embedded default (network hash {:#010x})",
+            nnue::NETWORK_HASH
+        );
+        Ok(Some(Arc::new(net)))
+    }
 }
 
 /// Runs one search to exactly `depth` plies and returns its `info ...` /
 /// `bestmove ...` transcript (the opening book is never consulted, so
 /// results are deterministic across machines).
-fn search_once(fen: &str, depth: i32, threads: usize, hash: usize) -> anyhow::Result<String> {
-    Ok(search_once_with_result(fen, depth, threads, hash)?.0)
+fn search_once(
+    fen: &str,
+    depth: i32,
+    threads: usize,
+    hash: usize,
+    params: &EvalParams,
+    syzygy: Option<&str>,
+    nnue: Option<&Arc<Network>>,
+) -> anyhow::Result<String> {
+    Ok(search_once_with_result(fen, depth, threads, hash, params, syzygy, nnue)?.0)
 }
 
 /// [`search_once`] plus the full [`SearchResult`] (instrumentation counters)
@@ -169,11 +250,18 @@ fn search_once(fen: &str, depth: i32, threads: usize, hash: usize) -> anyhow::Re
 /// reproducibility trap for the fixed-depth benchmark. This searches with a
 /// pure depth limit and formats the transcript in the same shape UCI would,
 /// so [`parse_info`] treats them identically.
+///
+/// `nnue` is already-loaded weights, not a path: the bench loads once and
+/// searches four positions, and re-decoding the net per position would put
+/// loading inside the measured search time.
 fn search_once_with_result(
     fen: &str,
     depth: i32,
     threads: usize,
     hash: usize,
+    params: &EvalParams,
+    syzygy: Option<&str>,
+    nnue: Option<&Arc<Network>>,
 ) -> anyhow::Result<(String, Option<morstilia::search::SearchResult>)> {
     use morstilia::search::{Searcher, TimeLimit};
     use morstilia::types::{is_mate, mate_plies};
@@ -188,8 +276,25 @@ fn search_once_with_result(
         infinite: true,
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
-    let mut searcher = Searcher::new(hash);
-    let r = searcher.search(&pos, &[], &limits, &stop, threads.max(1), &[]);
+    let mut searcher = Searcher::with_params(hash, params.clone());
+    searcher.set_nnue(nnue.cloned());
+    if let Some(path) = syzygy {
+        // `--syzygy` is opt-in: without it no tables are loaded and the
+        // search is byte-for-byte the pre-tablebase run. Warnings and the
+        // load summary go to stderr, never into the stdout transcript.
+        let (tb, report) = morstilia::endgame::Syzygy::load(path);
+        for w in &report.warnings {
+            eprintln!("morstilia: syzygy: {w}");
+        }
+        if report.files > 0 {
+            eprintln!(
+                "morstilia: syzygy: loaded {} table file(s) (max {} pieces) from {}",
+                report.files, report.max_pieces, report.path
+            );
+        }
+        searcher.set_syzygy(tb);
+    }
+    let r = searcher.search(&pos, &[], &limits, &Arc::new(stop), threads.max(1), &[]);
 
     let mut out = String::new();
     if r.is_none() {
@@ -215,6 +320,59 @@ fn search_once_with_result(
     Ok((out, Some(r)))
 }
 
+/// `--evaluate FEN [--eval-params FILE]`: prints the per-component evaluation
+/// breakdown of a position as one clean stdout line (`mg ... eg ... material
+/// ... pst ... pawn ... mobility ... king ... pieces ... passed ... space ...
+/// threats ... phase ... final ...`). Pure evaluation, no search, deterministic.
+fn cmd_evaluate(args: &[String], i: usize) -> anyhow::Result<()> {
+    let fen = args
+        .get(i + 1)
+        .filter(|f| !f.starts_with('-'))
+        .context("--evaluate needs a FEN string, e.g. --evaluate \"r6k/... \"")?;
+    let mut j = i + 2;
+    let mut params_path: Option<String> = None;
+    while j < args.len() {
+        let flag = args[j].clone();
+        match flag_value(args, &mut j, &flag) {
+            Some(v) if flag == "--eval-params" => params_path = Some(v),
+            _ => bail!("unexpected argument: {flag}"),
+        }
+    }
+    let pos = Position::from_fen(fen).context("invalid FEN")?;
+    let params = load_params(params_path.as_deref())?;
+    let parts = Evaluator.evaluate_parts_with(&pos, &params);
+    println!("{}", parts.stats_row());
+    Ok(())
+}
+
+/// `--export-params FILE`: writes the *baseline* parameters as a TOML file —
+/// the seed material for SPSA tuning and the documented `config/` artifact.
+fn cmd_export_params(args: &[String], i: usize) -> anyhow::Result<()> {
+    let path = args
+        .get(i + 1)
+        .filter(|f| !f.starts_with('-'))
+        .context("--export-params needs a file path")?;
+    let params = EvalParams::default();
+    params
+        .save(path)
+        .with_context(|| format!("cannot export eval params to {path:?}"))?;
+    println!("exported {} params to {path}", params.param_count());
+    Ok(())
+}
+
+/// Resolves an optional `--eval-params` CLI value: `None`/empty yields the
+/// baseline defaults; an explicit path must load cleanly (a CLI user who
+/// asks for a tuned file wants an error when it is wrong, unlike the UCI
+/// layer's non-fatal fallback).
+fn load_params(path: Option<&str>) -> anyhow::Result<EvalParams> {
+    match path {
+        None | Some("") => Ok(EvalParams::default()),
+        Some(p) => {
+            EvalParams::load(p).with_context(|| format!("cannot load eval params from {p:?}"))
+        }
+    }
+}
+
 /// `--bench [--depth N] [--threads N] [--hash MB] [--stats]`: searches a fixed
 /// set of positions and prints per-position nodes/time/NPS plus an aggregate.
 /// With `--stats` each line is followed by its instrumentation counters.
@@ -224,6 +382,10 @@ fn cmd_bench(args: &[String], i: usize) -> anyhow::Result<()> {
     let mut threads = DEFAULT_THREADS;
     let mut hash = DEFAULT_HASH_MB;
     let mut stats = false;
+    let mut params_path: Option<String> = None;
+    let mut syzygy: Option<String> = None;
+    let mut eval = EvalMode::Classical;
+    let mut net_path: Option<String> = None;
     while j < args.len() {
         let flag = args[j].clone();
         if flag == "--stats" {
@@ -241,9 +403,20 @@ fn cmd_bench(args: &[String], i: usize) -> anyhow::Result<()> {
             Some(v) if flag == "--hash" => {
                 hash = v.parse().context("--hash must be an integer (MB)")?
             }
+            Some(v) if flag == "--eval-params" => params_path = Some(v),
+            Some(v) if flag == "--syzygy" => syzygy = Some(v),
+            Some(v) if flag == "--eval" => {
+                eval = EvalMode::parse(&v)
+                    .with_context(|| format!("--eval must be classical or nnue, got {v:?}"))?
+            }
+            Some(v) if flag == "--nnue" => net_path = Some(v),
             _ => bail!("unexpected argument: {flag}"),
         }
     }
+    let params = load_params(params_path.as_deref())?;
+    // Loaded once, before any searching, so the decode is not repeated per
+    // position and never lands inside a reported search time.
+    let nnue = load_cli_nnue(eval, net_path.as_deref())?;
     let positions: &[(&str, &str)] = &[
         (
             "startpos",
@@ -259,11 +432,27 @@ fn cmd_bench(args: &[String], i: usize) -> anyhow::Result<()> {
         ),
         ("endgame", "8/8/4k3/3pN3/3P4/8/4K3/8 w - - 0 1"),
     ];
-    println!("bench: depth {depth} threads {threads} hash {hash} MB");
+    // Name the evaluator in the header: bench numbers are only comparable
+    // within one evaluator, and the two are not on the same centipawn scale.
+    println!(
+        "bench: depth {depth} threads {threads} hash {hash} MB eval {}{}",
+        eval.as_str(),
+        syzygy
+            .as_ref()
+            .map_or(String::new(), |p| format!(" syzygy {p}")),
+    );
     let mut tot_nodes = 0u64;
     let mut tot_time: u128 = 0;
     for (name, fen) in positions {
-        let (output, result) = search_once_with_result(fen, depth, threads, hash)?;
+        let (output, result) = search_once_with_result(
+            fen,
+            depth,
+            threads,
+            hash,
+            &params,
+            syzygy.as_deref(),
+            nnue.as_ref(),
+        )?;
         let (nodes, time_ms, best) = parse_info(&output);
         tot_nodes += nodes;
         tot_time += time_ms;
@@ -307,6 +496,40 @@ fn cmd_bench(args: &[String], i: usize) -> anyhow::Result<()> {
                     s.total_pruned(),
                     r.ebf(),
                 );
+                if s.tb_probes > 0 {
+                    println!(
+                        "  tb probe {} hit {} ({:.1}%) win {} draw {} loss {} cursed {}",
+                        s.tb_probes,
+                        s.tb_hits,
+                        100.0 * s.tb_hits as f64 / s.tb_probes as f64,
+                        s.tb_wins,
+                        s.tb_draws,
+                        s.tb_losses,
+                        s.tb_cursed,
+                    );
+                }
+                if r.threads > 1 {
+                    println!(
+                        "  smp threads {} workers {} rootmoves {} tt_hit {:.1}% tt_cut {:.1}%",
+                        r.threads,
+                        r.workers.len(),
+                        r.root_moves,
+                        s.tt_hit_pct(),
+                        s.tt_cutoff_pct(),
+                    );
+                    let wall = r.time_ms.max(1);
+                    for (i, w) in r.workers.iter().enumerate() {
+                        println!(
+                            "    worker {}{} nodes {} time {} ms idle {} ms depth {}",
+                            if w.main { "*" } else { "" },
+                            i,
+                            w.nodes,
+                            w.time_ms,
+                            wall.saturating_sub(w.time_ms),
+                            w.depth,
+                        );
+                    }
+                }
             }
         }
     }

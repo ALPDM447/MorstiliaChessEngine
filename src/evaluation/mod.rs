@@ -38,6 +38,7 @@ pub mod activity;
 pub mod king;
 pub mod material;
 pub mod mobility;
+pub mod params;
 pub mod passed_pawns;
 pub mod pawns;
 pub mod phase;
@@ -45,10 +46,21 @@ pub mod pieces;
 pub mod threats;
 
 use std::ops::{Add, AddAssign, Mul, Neg, Sub, SubAssign};
+use std::sync::OnceLock;
 
 use shakmaty::Position as _;
 
 pub use material::PIECE_VALUES;
+pub use params::EvalParams;
+
+/// The lazily-initialized baseline parameter set backing the parameterless
+/// [`Evaluator::evaluate`] / [`Evaluator::evaluate_parts`] entry points. The
+/// search hot path avoids this entirely: it passes the searcher's own
+/// `&EvalParams` through [`Evaluator::evaluate_with`].
+pub(crate) fn default_params() -> &'static EvalParams {
+    static PARAMS: OnceLock<EvalParams> = OnceLock::new();
+    PARAMS.get_or_init(EvalParams::default)
+}
 
 /// Midgame/endgame pair used by the tapered evaluation.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -134,9 +146,21 @@ impl SubAssign for Score {
 }
 
 /// Blends a score by the game phase (`phase` goes 0 → endgame … 24 → opening).
+///
+/// The 24 half-point divisor is the classic Stockfish-style constant; the
+/// parameterized phase is fed through [`tapered_at`] so a tuned `phase_max`
+/// stays in sync with the taper.
 #[inline]
 pub fn tapered(score: Score, phase: i32) -> i32 {
-    (score.mg * phase + score.eg * (24 - phase)) / 24
+    tapered_at(score, phase, 24)
+}
+
+/// [`tapered`] with an explicit phase maximum — used by the parameterized
+/// evaluation so a tuned `phase_max` and the taper divisor can never drift.
+#[inline]
+pub fn tapered_at(score: Score, phase: i32, phase_max: i32) -> i32 {
+    let max = phase_max.max(1);
+    (score.mg * phase + score.eg * (max - phase)) / max
 }
 
 /// The per-component breakdown of one evaluation, produced by
@@ -168,6 +192,11 @@ pub struct EvalParts {
     pub threats: Score,
     /// Game phase, 0 (endgame) .. 24 (opening).
     pub phase: i32,
+    /// Raw (white-relative) midgame total: the sum of every `*_mg` component
+    /// before blending.
+    pub total_mg: i32,
+    /// Raw (white-relative) endgame total before blending.
+    pub total_eg: i32,
     /// The final blended, side-to-move-relative score (`Evaluator::evaluate`).
     pub final_score: i32,
 }
@@ -197,7 +226,9 @@ impl EvalParts {
     /// debug path (`info string estat ...`). Not hot-path code.
     pub fn stats_row(&self) -> String {
         format!(
-            "material {} pst {} pawn {} mobility {} king {} pieces {} passed {} space {} threats {} phase {} final {}",
+            "mg {} eg {} material {} pst {} pawn {} mobility {} king {} pieces {} passed {} space {} threats {} phase {} final {}",
+            self.total_mg,
+            self.total_eg,
             self.blended(self.material),
             self.blended(self.pst),
             self.blended(self.pawn),
@@ -220,39 +251,68 @@ pub struct Evaluator;
 
 impl Evaluator {
     /// Evaluates `pos` in centipawns, positive when good for the side to
-    /// move. Used directly at leaves of the search.
+    /// move, using the baseline parameter set.
     #[inline]
     pub fn evaluate(&self, pos: &crate::board::Position) -> i32 {
-        self.evaluate_parts(pos).final_score
+        self.evaluate_with(pos, default_params())
     }
 
-    /// Computes the full evaluation and its per-component breakdown.
+    /// Evaluates `pos` with a specific tunable parameter set (the search hot
+    /// path; `p` is a shared reference owned by the search, so nothing is
+    /// copied or rebuilt per node).
+    #[inline]
+    pub fn evaluate_with(&self, pos: &crate::board::Position, p: &EvalParams) -> i32 {
+        self.evaluate_parts_with(pos, p).final_score
+    }
+
+    /// Evaluates `pos` from **White's** point of view — the convention Texel
+    /// tuning and dataset scoring use (the ordinary [`Evaluator::evaluate`]
+    /// returns the value from the side to move's perspective, which flips
+    /// every ply). Positional terms are already white-relative, so this is
+    /// just the pre-sign tapered total; it costs nothing beyond
+    /// [`Evaluator::evaluate_parts_with`].
+    #[inline]
+    pub fn evaluate_white_with(&self, pos: &crate::board::Position, p: &EvalParams) -> i32 {
+        let parts = self.evaluate_parts_with(pos, p);
+        tapered_at(
+            Score::new(parts.total_mg, parts.total_eg),
+            parts.phase,
+            p.phase_max,
+        )
+    }
+
+    /// Computes the full evaluation and its per-component breakdown with the
+    /// baseline parameter set.
+    pub fn evaluate_parts(&self, pos: &crate::board::Position) -> EvalParts {
+        self.evaluate_parts_with(pos, default_params())
+    }
+
+    /// Computes the full evaluation and its per-component breakdown for an
+    /// explicit parameter set.
     ///
     /// Cheap enough for the hot path (stack-only, no allocation: one
     /// [`pawns::PawnInfo`] scan and one [`passed_pawns::PassedInfo`] scan are
     /// shared by every term); the breakdown is what the instrumentation
     /// prints, so the search never evaluates twice.
-    pub fn evaluate_parts(&self, pos: &crate::board::Position) -> EvalParts {
+    pub fn evaluate_parts_with(&self, pos: &crate::board::Position, p: &EvalParams) -> EvalParts {
         let board = pos.board();
-        let phase = phase::game_phase(board);
+        let phase = phase::game_phase(board, p);
         let pawn_info = pawns::PawnInfo::scan(board);
         let passed_info = passed_pawns::PassedInfo::scan(&pawn_info);
 
-        let material = material::evaluate_material(board);
-        let pst = pieces::evaluate_pst(board);
-        let pawn = pawns::evaluate_pawns(&pawn_info);
-        let mobility = mobility::evaluate_mobility(board, &pawn_info);
-        let king = king::evaluate_king_safety(board, &pawn_info);
-        let pieces = activity::evaluate_pieces(board, &pawn_info, &passed_info, phase);
-        let passed = passed_pawns::evaluate_passed(board, &pawn_info, &passed_info);
-        let space = threats::evaluate_space(board, &pawn_info);
-        let threats = threats::evaluate_threats(board, &pawn_info)
-            + threats::evaluate_rooks(board, &pawn_info);
+        let material = material::evaluate_material(board, p);
+        let pst = pieces::evaluate_pst(board, p);
+        let pawn = pawns::evaluate_pawns(&pawn_info, p);
+        let mobility = mobility::evaluate_mobility(board, &pawn_info, p);
+        let king = king::evaluate_king_safety(board, &pawn_info, p);
+        let pieces = activity::evaluate_pieces(board, &pawn_info, &passed_info, phase, p);
+        let passed = passed_pawns::evaluate_passed(board, &pawn_info, &passed_info, p);
+        let space = threats::evaluate_space(board, &pawn_info, p);
+        let threats = threats::evaluate_threats(board, &pawn_info, p)
+            + threats::evaluate_rooks(board, &pawn_info, p);
 
-        let mut value = tapered(
-            material + pst + pawn + mobility + king + pieces + passed + space + threats,
-            phase,
-        );
+        let total = material + pst + pawn + mobility + king + pieces + passed + space + threats;
+        let mut value = tapered_at(total, phase, p.phase_max);
 
         // Draw detection used directly by the search (material-only draws).
         if pos.chess().is_insufficient_material() {
@@ -275,6 +335,8 @@ impl Evaluator {
             space,
             threats,
             phase,
+            total_mg: total.mg,
+            total_eg: total.eg,
             final_score,
         }
     }
@@ -463,6 +525,35 @@ mod tests {
             "phase", "final",
         ] {
             assert!(row.contains(token), "stats_row missing {token}: {row}");
+        }
+    }
+
+    #[test]
+    fn params_baseline_reproduces_legacy_eval() {
+        // The shipped baseline `EvalParams` reproduces the parameterless
+        // `Evaluator::evaluate` exactly, both from the in-code default and
+        // after a TOML round-trip (the `config/baseline_eval.toml` path).
+        let p = EvalParams::default();
+        let toml_p = EvalParams::from_toml_str(&p.to_toml_string().unwrap()).unwrap();
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/2N5/PPPP1PPP/R1BQKBNR w KQkq - 4 4",
+            "r2q1rk1/ppp2ppp/2nbpn2/3p1b2/2PP4/2N1PN2/PP2BPPP/R1BQ1RK1 w - - 0 1",
+            "6k1/8/8/8/3P4/8/8/4K3 w - - 0 1",
+            "7k/1R6/8/8/8/8/8/4K3 w - - 0 1",
+        ] {
+            let pos = Position::from_fen(fen).unwrap();
+            let v = Evaluator.evaluate(&pos);
+            assert_eq!(
+                Evaluator.evaluate_with(&pos, &p),
+                v,
+                "default params must reproduce evaluate for {fen}"
+            );
+            assert_eq!(
+                Evaluator.evaluate_with(&pos, &toml_p),
+                v,
+                "TOML round-tripped params must reproduce evaluate for {fen}"
+            );
         }
     }
 }

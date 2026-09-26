@@ -5,6 +5,7 @@
 use shakmaty::{Bitboard, Board, Color, attacks};
 
 use crate::evaluation::Score;
+use crate::evaluation::params::EvalParams;
 
 const FILE_A: u64 = 0x0101010101010101;
 
@@ -110,20 +111,15 @@ impl PawnInfo {
     }
 }
 
-const DOUBLED: Score = Score::new(-20, -40);
-const ISOLATED: Score = Score::new(-20, -30);
-const BACKWARD: Score = Score::new(-10, -15);
-const CONNECTED: Score = Score::new(15, 30);
-/// Penalty per pawn island *beyond the first*: a side whose pawns are split
-/// into several separate groups cannot support each other — the chain bonuses
-/// above only apply inside one group.
-const ISLAND: Score = Score::new(-10, -15);
-/// Bonus (mg) per pawn that is defended by a friendly pawn on an adjacent
-/// file one rank behind — the pawn chain is the backbone of the position.
-const PROTECTED_PAWN: Score = Score::new(6, 6);
-
-/// Evaluates pawn structure for both colors (white minus black).
-pub fn evaluate_pawns(info: &PawnInfo) -> Score {
+/// Evaluates pawn structure for both colors (white minus black), reading the
+/// per-term weights from `p`.
+pub fn evaluate_pawns(info: &PawnInfo, p: &EvalParams) -> Score {
+    let doubled = p.doubled;
+    let isolated = p.isolated;
+    let backward = p.backward;
+    let connected = p.connected;
+    let island = p.island;
+    let protected_pawn = p.protected_pawn;
     let mut score = Score::zero();
     for color in [Color::White, Color::Black] {
         let sign = if color == Color::White { 1 } else { -1 };
@@ -136,12 +132,14 @@ pub fn evaluate_pawns(info: &PawnInfo) -> Score {
             let mask = file_mask(f);
 
             if (pawns & Bitboard(mask)).count() > 1 {
-                color_score += DOUBLED;
+                color_score.mg += doubled[0];
+                color_score.eg += doubled[1];
             }
 
             let adj = adjacent_files(f);
             if (pawns & Bitboard(adj)).is_empty() {
-                color_score += ISOLATED;
+                color_score.mg += isolated[0];
+                color_score.eg += isolated[1];
             }
 
             // Connected: own pawn on an adjacent file and rank ± 1.
@@ -154,7 +152,8 @@ pub fn evaluate_pawns(info: &PawnInfo) -> Score {
                     rank_mask(r) | if r < 7 { rank_mask(r + 1) } else { 0 }
                 };
                 if !(own_adjacents & Bitboard(same_or_behind)).is_empty() {
-                    color_score += CONNECTED;
+                    color_score.mg += connected[0];
+                    color_score.eg += connected[1];
                 }
             }
 
@@ -162,7 +161,8 @@ pub fn evaluate_pawns(info: &PawnInfo) -> Score {
             // attacked by an enemy pawn.
             let defended = (info.pawn_attacks_of(color) & Bitboard::from_square(sq)).any();
             if defended {
-                color_score += PROTECTED_PAWN;
+                color_score.mg += protected_pawn[0];
+                color_score.eg += protected_pawn[1];
             }
             let front = if color == Color::White {
                 sq.offset(8)
@@ -173,14 +173,16 @@ pub fn evaluate_pawns(info: &PawnInfo) -> Score {
                 && front.is_some()
                 && (info.pawn_attacks_of(!color) & Bitboard::from_square(front.unwrap())).any()
             {
-                color_score += BACKWARD;
+                color_score.mg += backward[0];
+                color_score.eg += backward[1];
             }
         });
 
         // Pawn islands: too many disconnected groups cost structure value.
         let n = islands(info.files_of(color));
         for _ in 1..n {
-            color_score += ISLAND;
+            color_score.mg += island[0];
+            color_score.eg += island[1];
         }
 
         score.mg += sign * color_score.mg;
@@ -205,8 +207,8 @@ mod tests {
         // just the a2 pawn.
         let doubled = scans("6k1/8/8/8/8/P7/P7/4K3 w - - 0 1");
         let single = scans("6k1/8/8/8/8/8/P7/4K3 w - - 0 1");
-        let s1 = evaluate_pawns(&single);
-        let s2 = evaluate_pawns(&doubled);
+        let s1 = evaluate_pawns(&single, &EvalParams::default());
+        let s2 = evaluate_pawns(&doubled, &EvalParams::default());
         assert!(s1.mg - s2.mg >= 20, "doubled penalty expected");
     }
 
@@ -215,8 +217,8 @@ mod tests {
         // a2 pawn isolated (no b/c file pawns), but c2/d2 exist for 'single'
         let iso = scans("6k1/8/8/8/8/8/P1P5/4K3 w - - 0 1");
         let connected = scans("6k1/8/8/8/8/8/PPP5/4K3 w - - 0 1");
-        let s_iso = evaluate_pawns(&iso);
-        let s_con = evaluate_pawns(&connected);
+        let s_iso = evaluate_pawns(&iso, &EvalParams::default());
+        let s_con = evaluate_pawns(&connected, &EvalParams::default());
         assert!(s_con.mg > s_iso.mg, "connected > isolated");
     }
 
@@ -245,8 +247,8 @@ mod tests {
         // the a, c and f files (three islands).
         let chain = scans("6k1/8/8/8/8/PPP5/8/4K3 w - - 0 1");
         let split = scans("6k1/8/8/8/8/P1P3P1/8/4K3 w - - 0 1");
-        let s_chain = evaluate_pawns(&chain);
-        let s_split = evaluate_pawns(&split);
+        let s_chain = evaluate_pawns(&chain, &EvalParams::default());
+        let s_split = evaluate_pawns(&split, &EvalParams::default());
         assert!(
             s_chain.mg > s_split.mg,
             "one island must beat three: {} vs {}",
@@ -268,8 +270,8 @@ mod tests {
         // behind vs the same pawn running lone.
         let defended = scans("6k1/8/8/8/8/PPP5/8/4K3 w - - 0 1"); // b2-c2-d2 chain
         let lone = scans("6k1/8/8/8/8/P1P1P1P1/8/4K3 w - - 0 1"); // isolated
-        let s_def = evaluate_pawns(&defended);
-        let s_lone = evaluate_pawns(&lone);
+        let s_def = evaluate_pawns(&defended, &EvalParams::default());
+        let s_lone = evaluate_pawns(&lone, &EvalParams::default());
         assert!(
             s_def.mg > s_lone.mg,
             "protected chain must beat isolated pawns"

@@ -78,27 +78,30 @@ impl TimeLimit {
 
 /// Builds the [`TimeLimit`] for a parsed `go` command on `pos`.
 ///
-/// Precedence: `movetime` > clock allocation (`wtime/btime`) > a fixed
-/// default. `depth`, `nodes` and `infinite` are passed through.
+/// Precedence: `movetime` > clock allocation (`wtime/btime`) > `infinite`.
+/// `depth` and `nodes` limits do NOT imply time pressure — they only cap
+/// the search size. When no explicit time control is given, the search
+/// runs with `infinite = true` (full-window aspiration, no soft/hard deadline).
 pub fn time_limit_from_go(go: &GoParams, pos: &Position) -> TimeLimit {
     let depth = go.depth.filter(|&d| d > 0).map(|d| d as i32);
     let nodes = go.nodes;
 
-    let infty = go.infinite
-        && go.movetime.is_none()
-        && go.wtime.is_none()
-        && go.btime.is_none()
-        && depth.is_none()
-        && nodes.is_none();
+    // Time pressure exists only when an explicit time LIMIT is given
+    // (movetime or clock). `go infinite` means NO time pressure.
+    let has_time_control = go.movetime.is_some() || go.wtime.is_some() || go.btime.is_some();
+
+    // Infinite if explicitly requested OR no time control given at all
+    let infty = go.infinite || !has_time_control;
 
     let (soft_ms, hard_ms, movetime_ms) = if infty {
-        // `go infinite` / no limits at all: ignore time entirely.
+        // `go infinite` / no time control at all: ignore time entirely.
         (0, 0, None)
     } else if let Some(mt) = go.movetime {
         (mt, mt, Some(mt))
     } else if let Some(budget) = clock_budget(go, pos) {
         (budget * 3 / 4, budget, None)
     } else {
+        // Should not happen: has_time_control is true but no budget available
         (DEFAULT_BUDGET_MS * 3 / 4, DEFAULT_BUDGET_MS, None)
     };
 
@@ -236,11 +239,12 @@ mod tests {
     }
 
     #[test]
-    fn no_clock_falls_back_to_default_budget() {
+    fn no_clock_is_infinite() {
         let go = GoParams::default();
         let tl = time_limit_from_go(&go, &Position::startpos());
-        assert_eq!(tl.hard_ms, DEFAULT_BUDGET_MS);
-        assert_eq!(tl.soft_ms, DEFAULT_BUDGET_MS * 3 / 4);
+        assert!(tl.infinite);
+        assert_eq!(tl.hard_ms, 0);
+        assert_eq!(tl.soft_ms, 0);
         assert_eq!(tl.depth, None);
     }
 

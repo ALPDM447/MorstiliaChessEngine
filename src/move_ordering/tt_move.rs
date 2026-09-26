@@ -12,7 +12,7 @@
 
 use shakmaty::{Board, Role};
 
-use crate::evaluation::material::PIECE_VALUES;
+use crate::evaluation::params::EvalParams;
 use crate::types::RawMove;
 
 /// Ordering tier for the TT move — always first, well above everything else.
@@ -29,14 +29,15 @@ pub const KILLER1_TIER: i32 = 800_000;
 pub const KILLER2_TIER: i32 = 799_999;
 
 /// The captured piece's value in the MVV-LVA sense: the piece on `to`, or a
-/// pawn for en passant, or 0 for a pure promotion.
+/// pawn for en passant, or 0 for a pure promotion. Reads the tunable material
+/// values from `p` (kept consistent with SEE and the evaluation).
 #[inline]
-pub fn victim_value(board: &Board, m: RawMove) -> i32 {
+pub fn victim_value(board: &Board, m: RawMove, p: &EvalParams) -> i32 {
     if m.is_en_passant() {
-        PIECE_VALUES[Role::Pawn as usize]
+        p.piece_value(Role::Pawn)
     } else {
         match board.role_at(m.to()) {
-            Some(role) => PIECE_VALUES[role as usize],
+            Some(role) => p.piece_value(role),
             None => 0,
         }
     }
@@ -47,14 +48,14 @@ pub fn victim_value(board: &Board, m: RawMove) -> i32 {
 /// A promotion adds `(promoted − pawn) * 16` so an underpromotion that
 /// captures is still ranked sensibly against a lone queening move.
 #[inline]
-pub fn capture_score(board: &Board, m: RawMove) -> i32 {
-    let victim = victim_value(board, m);
+pub fn capture_score(board: &Board, m: RawMove, p: &EvalParams) -> i32 {
+    let victim = victim_value(board, m, p);
     let attacker = board
         .piece_at(m.from())
-        .map_or(0, |p| PIECE_VALUES[p.role as usize]);
+        .map_or(0, |piece| p.piece_value(piece.role));
     let mut score = victim * 16 - attacker;
     if let Some(promo) = m.promotion() {
-        score += (PIECE_VALUES[promo as usize] - PIECE_VALUES[Role::Pawn as usize]) * 16;
+        score += (p.piece_value(promo) - p.piece_value(Role::Pawn)) * 16;
     }
     score
 }
@@ -75,10 +76,14 @@ mod tests {
         Position::from_fen(fen).unwrap()
     }
 
+    fn params() -> EvalParams {
+        EvalParams::default()
+    }
+
     fn score(fen: &str, uci: &str) -> i32 {
         let p = pos(fen);
         let m = p.raw_move_from_uci(uci).unwrap();
-        capture_score(p.board(), m)
+        capture_score(p.board(), m, &params())
     }
 
     #[test]
@@ -105,7 +110,7 @@ mod tests {
         let p = pos("rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3");
         let m = p.raw_move_from_uci("e5f6").unwrap();
         assert!(m.is_en_passant());
-        assert_eq!(victim_value(p.board(), m), 100);
+        assert_eq!(victim_value(p.board(), m, &params()), 100);
         assert!(is_capture_or_promotion(p.board(), m));
     }
 

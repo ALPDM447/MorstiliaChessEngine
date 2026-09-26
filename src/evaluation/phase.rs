@@ -8,20 +8,23 @@
 use shakmaty::{Board, Color};
 
 use crate::evaluation::Score;
+use crate::evaluation::params::EvalParams;
 
-/// Phase when every piece is still on the board.
+/// Phase when every piece is still on the board (the legacy, unparameterized
+/// denominator used by [`crate::evaluation::tapered`]).
 pub const PHASE_MAX: i32 = 24;
 
-/// Computes the game phase of `board`.
-pub fn game_phase(board: &Board) -> i32 {
+/// Computes the game phase of `board` using the tunable per-piece phase
+/// weights and clamping to the tunable phase maximum.
+pub fn game_phase(board: &Board, p: &EvalParams) -> i32 {
     let mut phase = 0i32;
     for color in [Color::White, Color::Black] {
-        phase += 4 * (board.by_piece(shakmaty::Role::Queen.of(color)).count() as i32);
-        phase += 2 * (board.by_piece(shakmaty::Role::Rook.of(color)).count() as i32);
-        phase += board.by_piece(shakmaty::Role::Bishop.of(color)).count() as i32;
-        phase += board.by_piece(shakmaty::Role::Knight.of(color)).count() as i32;
+        phase += p.phase_queen * (board.by_piece(shakmaty::Role::Queen.of(color)).count() as i32);
+        phase += p.phase_rook * (board.by_piece(shakmaty::Role::Rook.of(color)).count() as i32);
+        phase += p.phase_bishop * (board.by_piece(shakmaty::Role::Bishop.of(color)).count() as i32);
+        phase += p.phase_knight * (board.by_piece(shakmaty::Role::Knight.of(color)).count() as i32);
     }
-    phase.clamp(0, PHASE_MAX)
+    phase.clamp(0, p.phase_max.max(1))
 }
 
 /// Scales `score` according to `phase` and returns the blended value.
@@ -38,7 +41,7 @@ mod tests {
     fn opening_is_phase_max() {
         let chess = shakmaty::Chess::default();
         let board = chess.board();
-        assert_eq!(game_phase(board), PHASE_MAX);
+        assert_eq!(game_phase(board, &EvalParams::default()), PHASE_MAX);
     }
 
     #[test]
@@ -46,7 +49,7 @@ mod tests {
         let board = crate::testutil::chess("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1")
             .board()
             .clone();
-        assert_eq!(game_phase(&board), 0);
+        assert_eq!(game_phase(&board, &EvalParams::default()), 0);
     }
 
     #[test]
@@ -54,6 +57,6 @@ mod tests {
         let board = crate::testutil::chess("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1")
             .board()
             .clone();
-        assert_eq!(game_phase(&board), 4);
+        assert_eq!(game_phase(&board, &EvalParams::default()), 4);
     }
 }

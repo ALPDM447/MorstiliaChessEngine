@@ -314,6 +314,10 @@ mod tests {
         MoveCtx::of(&p, p.raw_move_from_uci(uci).unwrap())
     }
 
+    fn eval_params() -> crate::evaluation::EvalParams {
+        crate::evaluation::EvalParams::default()
+    }
+
     #[test]
     fn history_grows_on_reward_and_clamps() {
         let mut h = History::new();
@@ -477,9 +481,11 @@ mod tests {
             CAP_HIST_MAX_ADJ,
             "saturation must hit the clamp"
         );
-        let rook_score = crate::move_ordering::tt_move::capture_score(pos.board(), rook)
-            + h.capture_adjustment(pos.board(), rook);
-        let knight_score = crate::move_ordering::tt_move::capture_score(pos.board(), knight);
+        let rook_score =
+            crate::move_ordering::tt_move::capture_score(pos.board(), rook, &eval_params())
+                + h.capture_adjustment(pos.board(), rook);
+        let knight_score =
+            crate::move_ordering::tt_move::capture_score(pos.board(), knight, &eval_params());
         assert!(
             rook_score > knight_score,
             "history must be able to decide same-victim ties: {rook_score} vs {knight_score}"
@@ -498,10 +504,12 @@ mod tests {
             h.update_capture(pawn_pos.board(), pm, bonus(10));
             h.update_capture(queen_pos.board(), qm, -bonus(10));
         }
-        let pawn_score = crate::move_ordering::tt_move::capture_score(pawn_pos.board(), pm)
-            + h.capture_adjustment(pawn_pos.board(), pm);
-        let queen_score = crate::move_ordering::tt_move::capture_score(queen_pos.board(), qm)
-            + h.capture_adjustment(queen_pos.board(), qm);
+        let pawn_score =
+            crate::move_ordering::tt_move::capture_score(pawn_pos.board(), pm, &eval_params())
+                + h.capture_adjustment(pawn_pos.board(), pm);
+        let queen_score =
+            crate::move_ordering::tt_move::capture_score(queen_pos.board(), qm, &eval_params())
+                + h.capture_adjustment(queen_pos.board(), qm);
         // Sanity: the reward really is at its bound by now.
         assert_eq!(h.capture_adjustment(pawn_pos.board(), pm), CAP_HIST_MAX_ADJ);
         assert_eq!(

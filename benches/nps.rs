@@ -1,6 +1,7 @@
 //! Search-speed benchmark: full iterative-deepening searches at fixed
 //! depths, reporting nodes per second. Run with `cargo bench --bench nps`.
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -10,7 +11,7 @@ use morstilia::search::{Searcher, TimeLimit};
 fn bench_search(c: &mut Criterion, name: &str, fen: &str, depth: i32) {
     let pos = Position::from_fen(fen).expect("valid FEN");
     let mut searcher = Searcher::new(64);
-    let stop = AtomicBool::new(false);
+    let stop = Arc::new(AtomicBool::new(false));
     let limits = TimeLimit {
         depth: Some(depth),
         ..TimeLimit::unlimited()

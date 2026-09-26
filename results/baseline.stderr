@@ -1,0 +1,5 @@
+match: config/baseline_eval.toml vs config/baseline_eval.toml  (candidate: white)  suite: classical-v1 (48 positions)  seed 1
+time control: depth 8  threads 1 / 1  tt 16 / 16 MB  alternate colors: true  parallel: 1
+game   1/ 40: 1/2-1/2  french-winawer  plies  60  (threefold-repetition)
+game   2/ 40: 1/2-1/2  pirc-btm  plies 165  (threefold-repetition)
+game   3/ 40: 1/2-1/2  sicilian-najdorf  plies 141  (threefold-repetition)

@@ -16,7 +16,7 @@ use crate::book::polyglot_key;
 use crate::types::{MoveList, RawMove};
 
 /// A position ready for search.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Position {
     pub chess: Chess,
     /// Zobrist hash of `chess`, maintained incrementally when possible.
@@ -137,7 +137,15 @@ impl Position {
     #[inline]
     pub fn legal_moves_ordered(&self, tables: &crate::move_ordering::OrderingTables) -> MoveList {
         let mut moves = self.legal_moves();
-        crate::move_ordering::order_moves(&mut moves, self, tables, RawMove::NULL);
+        // Ordering tiers read the tunable material values; outside a search
+        // (no `Searcher` in scope) the baseline parameter set is authoritative.
+        crate::move_ordering::order_moves(
+            &mut moves,
+            self,
+            tables,
+            RawMove::NULL,
+            crate::evaluation::default_params(),
+        );
         moves
     }
 

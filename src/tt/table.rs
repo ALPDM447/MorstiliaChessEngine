@@ -21,7 +21,7 @@
 //! replaced eagerly; otherwise a same-key hit refreshes unconditionally and
 //! a same-depth-or-deeper entry keeps the slot.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::types::{Depth, RawMove};
 
@@ -117,13 +117,18 @@ impl Payload {
 }
 
 /// A sized, lock-free transposition table.
+///
+/// All read/write methods take `&self`: the table is meant to be shared behind
+/// an `Arc` by the search's worker threads, so the only `&mut self` method is
+/// [`TranspositionTable::resize`] (which replaces the whole table and is only
+/// called between searches).
 pub struct TranspositionTable {
     /// Entry array (usable capacity `mask + 1` entries; `mask` is a power of
     /// two minus one).
     keys: Box<[AtomicU32]>,
     data: Box<[AtomicU64]>,
     mask: usize,
-    generation: u8,
+    generation: AtomicU8,
     /// Total entries written since the last [`TranspositionTable::new_search`]
     /// (relaxed atomic; diagnostics only — never read in the hot path).
     stores: AtomicU64,
@@ -160,7 +165,7 @@ impl TranspositionTable {
             keys,
             data,
             mask: entries - 1,
-            generation: 0,
+            generation: AtomicU8::new(0),
             stores: AtomicU64::new(0),
         }
     }
@@ -178,14 +183,14 @@ impl TranspositionTable {
         *self = TranspositionTable::new(size_mb);
     }
 
-    pub fn clear(&mut self) {
+    pub fn clear(&self) {
         for k in self.keys.iter() {
             k.store(0, Ordering::Relaxed);
         }
         for d in self.data.iter() {
             d.store(0, Ordering::Relaxed);
         }
-        self.generation = 0;
+        self.generation.store(0, Ordering::Relaxed);
     }
 
     #[inline]
@@ -198,10 +203,14 @@ impl TranspositionTable {
         self.entries() * ENTRY_BYTES
     }
 
-    /// Advances the generation (called at the start of each search).
+    /// Advances the generation (called at the start of each search). The
+    /// generation is atomic so `new_search` works on a shared `&self` table
+    /// (SMP workers keep probing/storing while one of them starts the next
+    /// generation — stores are only ever written by workers belonging to the
+    /// search that bumped it, but reads never race the counter itself).
     #[inline]
-    pub fn new_search(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
+    pub fn new_search(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
         self.stores.store(0, Ordering::Relaxed);
     }
 
@@ -253,7 +262,14 @@ impl TranspositionTable {
     /// *storing* node; mate scores are adjusted on read by the caller.
     #[inline]
     pub fn store(&self, hash: u64, mv: RawMove, score: i32, depth: Depth, bound: Bound) {
-        self.store_impl(hash, mv, score, depth, bound, self.generation)
+        self.store_impl(
+            hash,
+            mv,
+            score,
+            depth,
+            bound,
+            self.generation.load(Ordering::Relaxed),
+        )
     }
 
     fn store_impl(
@@ -303,7 +319,7 @@ impl TranspositionTable {
 
     #[inline]
     pub fn generation(&self) -> u8 {
-        self.generation
+        self.generation.load(Ordering::Relaxed)
     }
 }
 
@@ -387,7 +403,7 @@ mod tests {
 
     #[test]
     fn generations_expire_old_entries() {
-        let mut tt = TranspositionTable::with_entries(1);
+        let tt = TranspositionTable::with_entries(1);
         let h1 = h(11);
         tt.store(
             h1,
@@ -412,7 +428,7 @@ mod tests {
 
     #[test]
     fn gold_plating_protects_old_but_deep_entries() {
-        let mut tt = TranspositionTable::with_entries(1);
+        let tt = TranspositionTable::with_entries(1);
         let h1 = h(111);
         tt.store(
             h1,

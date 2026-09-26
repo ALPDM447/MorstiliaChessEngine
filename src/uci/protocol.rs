@@ -27,8 +27,10 @@ use shakmaty::zobrist::Zobrist64;
 
 use crate::board::Position;
 use crate::book::{PolyglotBook, SplitMix64};
-use crate::config::EngineConfig;
+use crate::config::{EngineConfig, EvalMode};
+use crate::endgame::{LoadReport, Syzygy};
 use crate::evaluation::Evaluator;
+use crate::nnue::network::Network;
 use crate::search::{SearchResult, Searcher};
 use crate::types::{RawMove, is_mate, mate_plies};
 use crate::uci::parser::{Command, GoParams};
@@ -77,13 +79,27 @@ impl UciEngine {
 
     /// Creates an engine writing to an arbitrary sink (tests, pipes).
     pub fn with_writer(writer: Box<dyn Write + Send>) -> UciEngine {
-        let config = EngineConfig::default();
+        let mut config = EngineConfig::default();
         let books = load_books(&config);
+        let params = load_params(&config);
+        // Syzygy: load whatever the configured path holds (an empty path
+        // keeps the tablebase inert). Warnings + the loaded-file summary go
+        // to stderr — never into the UCI stdout stream.
+        let (syzygy, tb_report) = load_syzygy(&config.syzygy_path);
+        write_syzygy_report(&tb_report);
+        // NNUE: the default config asks for the classical evaluator, so this is
+        // a no-op for a stock engine. Decoding the 100 MB of LEB128 into
+        // resident weights costs ~0.25 s (release) / ~2 s (debug), so it
+        // happens once here and never per search.
+        let nnue = load_nnue(&mut config);
+        let mut searcher = Searcher::with_params(crate::config::DEFAULT_HASH_MB, params);
+        searcher.set_syzygy(syzygy);
+        searcher.set_nnue(nnue);
         UciEngine {
             config,
             board: Position::startpos(),
             history: Vec::new(),
-            searcher: Some(Searcher::new(crate::config::DEFAULT_HASH_MB)),
+            searcher: Some(searcher),
             books,
             stop: Arc::new(AtomicBool::new(false)),
             worker: None,
@@ -194,8 +210,63 @@ impl UciEngine {
                     s.resize(self.config.hash_mb);
                 }
             }
+            "Threads" => {
+                // Pre-size the persistent worker pool (growing/shrinking it
+                // joins retired workers so no thread leaks across searches).
+                if let Some(s) = &mut self.searcher {
+                    s.set_threads(self.config.threads);
+                }
+            }
+            "EvalParamsPath" => {
+                // Swap the parameter set in place: the TT (and its game state)
+                // stays untouched, only the evaluation lens changes.
+                let params = load_params(&self.config);
+                if let Some(s) = &mut self.searcher {
+                    s.params = Arc::new(params);
+                }
+            }
+            "Eval" => {
+                // Change evaluation mode. If switching to NNUE, try to load the net.
+                // On load failure, fall back to classical and report error.
+                let nnue = if self.config.eval == EvalMode::Nnue {
+                    load_nnue(&mut self.config)
+                } else {
+                    None
+                };
+                // If we requested NNUE but couldn't load a net, fall back to classical.
+                if self.config.eval == EvalMode::Nnue && nnue.is_none() {
+                    eprintln!("info string nnue: falling back to the classical evaluator");
+                    self.config.eval = EvalMode::Classical;
+                }
+                if let Some(s) = &mut self.searcher {
+                    s.set_nnue(nnue);
+                }
+            }
+            "NNUEFile" => {
+                // Change the NNUE file path. If currently in NNUE mode, try to load
+                // the new net. On failure, keep the current evaluator (don't change
+                // config.eval) and report error — the user may send a corrected path.
+                let nnue = if self.config.eval == EvalMode::Nnue {
+                    load_nnue(&mut self.config)
+                } else {
+                    None
+                };
+                if let Some(s) = &mut self.searcher {
+                    s.set_nnue(nnue);
+                }
+            }
             "BookEnabled" | "BookPath" => {
                 self.books = load_books(&self.config);
+            }
+            "SyzygyPath" => {
+                // Reload the tablebase from the (possibly changed) path. An
+                // empty or invalid path degrades to an inert tablebase — the
+                // engine simply stops probing.
+                let (tb, report) = load_syzygy(&self.config.syzygy_path);
+                write_syzygy_report(&report);
+                if let Some(s) = &mut self.searcher {
+                    s.set_syzygy(tb);
+                }
             }
             _ => {}
         }
@@ -220,7 +291,7 @@ impl UciEngine {
         // Opening book (not consulted for infinite/ponder/searchmoves).
         if let Some(m) = self.book_move(params) {
             if self.config.debug {
-                eprintln!("info string book move {}", m.to_uci());
+                eprintln!("info string book hit: selected {}", m.to_uci());
             }
             self.output(&format!("bestmove {}\n", m.to_uci()));
             return;
@@ -238,10 +309,9 @@ impl UciEngine {
 
         let stop = Arc::new(AtomicBool::new(false));
         self.stop = stop.clone();
-        let mut searcher = self
-            .searcher
-            .take()
-            .unwrap_or_else(|| Searcher::new(self.config.hash_mb));
+        let mut searcher = self.searcher.take().unwrap_or_else(|| {
+            Searcher::with_params(self.config.hash_mb, load_params(&self.config))
+        });
         let back: Arc<Mutex<Option<Searcher>>> = Arc::new(Mutex::new(None));
         let back2 = back.clone();
         let result_slot = self.last_result.clone();
@@ -250,6 +320,9 @@ impl UciEngine {
 
         let handle = std::thread::spawn(move || {
             let result = searcher.search(&root, &history, &limits, &stop, threads, &searchmoves);
+            // Snapshot the params before the searcher goes back home (the
+            // debug eval breakdown below still needs them).
+            let params = searcher.params.clone();
             *result_slot.lock().unwrap() = Some(result.clone());
             *back2.lock().unwrap() = Some(searcher);
             let mut sink = out.lock().unwrap();
@@ -262,7 +335,7 @@ impl UciEngine {
             let _ = writeln!(sink, "bestmove {best}");
             if debug {
                 let _ = write_debug_stats(&mut *sink, &result);
-                let _ = write_eval_breakdown(&mut *sink, &root);
+                let _ = write_eval_breakdown(&mut *sink, &root, &params);
             }
             let _ = sink.flush();
         });
@@ -342,7 +415,12 @@ impl UciEngine {
 
 /// Builds the `info depth ... score ... nodes ... nps ... time ... pv ...`
 /// line for a finished search. Returns without writing when the search never
-/// produced a result (aborted before the first iteration).
+/// produced a result (aborted before the first iteration). Multi-threaded
+/// searches append one `info string smp ...` line — worker count, root-task
+/// total, shared-TT hit/cutoff rate plus a per-worker nodes/time/depth (and a
+/// best-effort idle estimate: wall time minus the worker's own busy period).
+/// `Threads = 1` output is unchanged, keeping single-thread bench transcripts
+/// byte-identical.
 fn write_info(out: &mut dyn Write, r: &SearchResult) -> std::io::Result<()> {
     if r.is_none() {
         return Ok(());
@@ -362,7 +440,33 @@ fn write_info(out: &mut dyn Write, r: &SearchResult) -> std::io::Result<()> {
         r.nps(),
         r.time_ms,
         pv.join(" ")
-    )
+    )?;
+    if r.threads > 1 {
+        writeln!(
+            out,
+            "info string smp threads {} workers {} rootmoves {} nps {} tt_hit {:.1}% tt_cut {:.1}%",
+            r.threads,
+            r.workers.len(),
+            r.root_moves,
+            r.nps(),
+            r.stats.tt_hit_pct(),
+            r.stats.tt_cutoff_pct(),
+        )?;
+        let wall = r.time_ms.max(1);
+        for (i, w) in r.workers.iter().enumerate() {
+            writeln!(
+                out,
+                "info string smp worker {}{} nodes {} time {}ms idle {}ms depth {}",
+                if w.main { "*" } else { "" },
+                i,
+                w.nodes,
+                w.time_ms,
+                wall.saturating_sub(w.time_ms),
+                w.depth,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Writes the instrumentation counters as an `info string` line (only emitted
@@ -404,12 +508,37 @@ fn write_debug_stats(out: &mut dyn Write, r: &SearchResult) -> std::io::Result<(
         s.probcut_attempts,
         s.total_pruned(),
         r.ebf(),
-    )
+    )?;
+    if s.tb_probes > 0 {
+        writeln!(
+            out,
+            "info string stats3 tb_probe {} tb_hit {} ({:.1}%) win {} draw {} loss {} cursed {}",
+            s.tb_probes,
+            s.tb_hits,
+            if s.tb_probes > 0 {
+                100.0 * s.tb_hits as f64 / s.tb_probes as f64
+            } else {
+                0.0
+            },
+            s.tb_wins,
+            s.tb_draws,
+            s.tb_losses,
+            s.tb_cursed,
+        )
+    } else {
+        Ok(())
+    }
 }
 
-/// Writes the evaluation component breakdown for `pos` (only in Debug mode).
-fn write_eval_breakdown(out: &mut dyn Write, pos: &Position) -> std::io::Result<()> {
-    let parts = Evaluator.evaluate_parts(pos);
+/// Writes the evaluation component breakdown for `pos` (only in Debug mode),
+/// using the search's own parameter set so tuned evals are diagnosed
+/// consistently.
+fn write_eval_breakdown(
+    out: &mut dyn Write,
+    pos: &Position,
+    params: &crate::evaluation::EvalParams,
+) -> std::io::Result<()> {
+    let parts = Evaluator.evaluate_parts_with(pos, params);
     writeln!(out, "info string estat {}", parts.stats_row())
 }
 
@@ -489,6 +618,107 @@ fn load_books(config: &EngineConfig) -> Vec<PolyglotBook> {
     books
 }
 
+/// Loads the Syzygy tablebase for an engine configuration. See
+/// [`crate::endgame::Syzygy::load`]; the UCI stdout sink never sees
+/// tablebase traffic.
+fn load_syzygy(path: &str) -> (Syzygy, LoadReport) {
+    Syzygy::load(path)
+}
+
+/// Prints the tablebase load summary and any warnings to stderr (never into
+/// the UCI stdout stream). Mirrors the book-load reporting conventions.
+fn write_syzygy_report(report: &LoadReport) {
+    for w in &report.warnings {
+        eprintln!("info string syzygy: {w}");
+    }
+    if report.files > 0 {
+        eprintln!(
+            "info string syzygy: loaded {} table file(s) (max {} pieces) from {}",
+            report.files, report.max_pieces, report.path
+        );
+    }
+}
+
+/// Loads the evaluation parameters for an engine configuration. An empty
+/// `EvalParamsPath` yields the baseline defaults; a configured but unreadable
+/// or malformed file falls back to the defaults with a stderr note (never
+/// fatal — the engine must still start).
+fn load_params(config: &EngineConfig) -> crate::evaluation::EvalParams {
+    use crate::evaluation::EvalParams;
+    if config.eval_params_path.is_empty() {
+        return EvalParams::default();
+    }
+    match EvalParams::load(&config.eval_params_path) {
+        Ok(p) => {
+            eprintln!(
+                "info string loaded eval params from {}",
+                config.eval_params_path
+            );
+            p
+        }
+        Err(e) => {
+            eprintln!(
+                "info string eval params {}: {e:#} — using baseline defaults",
+                config.eval_params_path
+            );
+            EvalParams::default()
+        }
+    }
+}
+
+/// Loads the NNUE net for an engine configuration, if one is selected.
+///
+/// Returns `None` with a stderr note if the net cannot be used. The caller
+/// is responsible for handling the fallback (e.g., reverting `config.eval`
+/// when `Eval nnue` was explicitly requested but the net failed to load).
+/// This function does NOT modify `config.eval`.
+///
+/// The stdout contract is absolute: this only ever writes to stderr.
+fn load_nnue(config: &mut EngineConfig) -> Option<Arc<Network>> {
+    use crate::config::EvalMode;
+    use crate::nnue;
+
+    if config.eval != EvalMode::Nnue {
+        return None;
+    }
+
+    // If an explicit NNUEFile is set, try to load from that file.
+    // Otherwise, use the embedded default network.
+    let net = if !config.nnue_path.is_empty() {
+        let path = nnue::resolve_net_path(&config.nnue_path);
+        match nnue::load_network(&path) {
+            Ok(net) => {
+                eprintln!(
+                    "info string nnue: loaded {} (network hash {:#010x})",
+                    path.display(),
+                    nnue::NETWORK_HASH
+                );
+                Some(net)
+            }
+            Err(e) => {
+                eprintln!("info string nnue: cannot use {}: {e}", path.display());
+                None
+            }
+        }
+    } else {
+        // No explicit file: use the embedded Stockfish 19 network
+        match nnue::load_embedded_network() {
+            Some(net) => {
+                eprintln!(
+                    "info string nnue: loaded embedded default (network hash {:#010x})",
+                    nnue::NETWORK_HASH
+                );
+                Some(net)
+            }
+            None => {
+                eprintln!("info string nnue: embedded default network failed validation");
+                None
+            }
+        }
+    };
+    net.map(Arc::new)
+}
+
 /// Re-exports the converter from the time module for the `go` command.
 pub(crate) use crate::search::time::time_limit_from_go;
 
@@ -557,9 +787,77 @@ mod tests {
         }
     }
 
+    /// The `bestmove <m>` value from a transcript.
+    fn bestmove(out: &str) -> String {
+        out.lines()
+            .find_map(|l| l.strip_prefix("bestmove "))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("no bestmove line in: {out}"))
+    }
+
+    #[test]
+    fn book_serves_opening_moves_then_search_takes_over() {
+        // A scratch book containing *only* a startpos entry: the first `go`
+        // answers from the book (no `info` lines), the second — after the
+        // position left the book (e2e4 played) — must run a real search.
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "morstilia_book_switch_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mini.bin");
+        let mut bytes = Vec::new();
+        // startpos key; e2(12)->e4(28); raw = from<<6|to = 796.
+        let key = 0x463b96181691fc9cu64;
+        bytes.extend_from_slice(&key.to_be_bytes());
+        bytes.extend_from_slice(&796u16.to_be_bytes());
+        bytes.extend_from_slice(&10u16.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (s, _) = drive(&[
+            "setoption name BookEnabled value true",
+            &format!("setoption name BookPath value {}", path.display()),
+            "position startpos",
+            "go depth 1",
+        ]);
+        assert_eq!(
+            bestmove(&s),
+            "e2e4",
+            "the book must answer at startpos: {s}"
+        );
+        assert!(
+            !s.contains("info depth"),
+            "a book move must come without search info: {s}"
+        );
+
+        let (s, _) = drive(&[
+            "setoption name BookEnabled value true",
+            &format!("setoption name BookPath value {}", path.display()),
+            "position startpos moves e2e4",
+            "go depth 2",
+        ]);
+        assert!(
+            s.lines().any(|l| l.starts_with("info depth ")),
+            "after the book ends the search must run: {s}"
+        );
+        assert!(bestmove(&s).len() >= 4, "bestmove present: {s}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn go_depth_produces_bestmove_line() {
-        let (s, _) = drive(&["position startpos", "go depth 3"]);
+        // Disable the auto-discovered opening book explicitly so the bounded
+        // `go` exercises the search itself (the repo ships a real default book
+        // at `book/book.bin`, which would otherwise answer `e2e4` directly).
+        let (s, _) = drive(&[
+            "setoption name BookEnabled value false",
+            "position startpos",
+            "go depth 3",
+        ]);
         assert!(
             s.lines().any(|l| l.starts_with("bestmove ")),
             "missing bestmove in: {s}"
@@ -621,10 +919,15 @@ mod tests {
 
     #[test]
     fn no_book_found_is_not_fatal() {
-        // There is no `book/` directory next to the test binary, so both
-        // auto-detect and empty BookPath simply produce no book and the
-        // engine still searches normally.
-        let (s, _) = drive(&["position startpos", "go depth 2"]);
+        // A missing/disabled book is never fatal: with the book turned off
+        // (and, by extension, any unreadable BookPath), the engine must still
+        // search normally. (The repo ships a default book at `book/book.bin`,
+        // which is why the book is disabled explicitly here.)
+        let (s, _) = drive(&[
+            "setoption name BookEnabled value false",
+            "position startpos",
+            "go depth 2",
+        ]);
         assert!(s.lines().any(|l| l.starts_with("bestmove ")));
     }
 

@@ -1,0 +1,7 @@
+match: baseline vs baseline  (candidate: white)  suite: classical-v1 (48 positions)  seed 1
+time control: depth 4  threads 1 / 1  tt 16 / 16 MB  alternate colors: true  parallel: 2
+game   1/  4: 1/2-1/2  french-winawer  plies  69  (threefold-repetition)
+game   2/  4: 0-1  pirc-btm  plies 104  (adjudicated-mate)
+game   3/  4: 1-0  sicilian-najdorf  plies 157  (adjudicated-mate)
+game   4/  4: 0-1  french-tarrasch-btm  plies 137  (adjudicated-mate)
+wrote match report to results/smoke.json

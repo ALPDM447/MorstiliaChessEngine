@@ -21,6 +21,7 @@ pub mod tt_move;
 use shakmaty::Role;
 
 use crate::board::Position;
+use crate::evaluation::params::EvalParams;
 use crate::types::{MoveList, RawMove};
 
 pub use history::{History, MoveCtx};
@@ -65,7 +66,8 @@ impl OrderingTables {
 
 /// Scores `m` for ordering. `tt_move` may be [`RawMove::NULL`]; `ply`, `prev`
 /// and `ant` are the current ply and the previous two move contexts (only
-/// used for killer and continuation lookups).
+/// used for killer and continuation lookups). `p` carries the tunable material
+/// values that drive the MVV-LVA tiers (the searcher's shared parameter set).
 #[inline]
 pub fn score_move(
     pos: &Position,
@@ -75,6 +77,7 @@ pub fn score_move(
     ply: usize,
     prev: Option<MoveCtx>,
     ant: Option<MoveCtx>,
+    p: &EvalParams,
 ) -> i32 {
     if tt_move != RawMove::NULL && m == tt_move {
         return tt_move::TT_TIER;
@@ -85,7 +88,7 @@ pub fn score_move(
         // MVV-LVA dominates; the capture-history tiebreak stays inside the
         // victim tier (see `History::capture_adjustment`).
         return tt_move::CAPTURE_TIER
-            + capture_score(board, m)
+            + capture_score(board, m, p)
             + tables.history.capture_adjustment(board, m);
     }
 
@@ -120,12 +123,14 @@ pub fn order_moves(
     pos: &Position,
     tables: &OrderingTables,
     tt_move: RawMove,
+    p: &EvalParams,
 ) {
-    order_moves_ctx(moves, pos, tables, tt_move, 0, None, None);
+    order_moves_ctx(moves, pos, tables, tt_move, 0, None, None, p);
 }
 
 /// [`order_moves`] with full search context: killer lookup at `ply` and the
 /// previous two move contexts for continuation history.
+#[allow(clippy::too_many_arguments)]
 pub fn order_moves_ctx(
     moves: &mut MoveList,
     pos: &Position,
@@ -134,10 +139,11 @@ pub fn order_moves_ctx(
     ply: usize,
     prev: Option<MoveCtx>,
     ant: Option<MoveCtx>,
+    p: &EvalParams,
 ) {
     moves
         .as_mut_slice()
-        .sort_unstable_by_key(|&m| -score_move(pos, m, tt_move, tables, ply, prev, ant));
+        .sort_unstable_by_key(|&m| -score_move(pos, m, tt_move, tables, ply, prev, ant, p));
 }
 
 /// Convenience: the mover's role for a quiet-move history update at `pos`
@@ -161,13 +167,17 @@ mod tests {
         p.raw_move_from_uci(s).unwrap()
     }
 
+    fn params() -> crate::evaluation::EvalParams {
+        crate::evaluation::EvalParams::default()
+    }
+
     #[test]
     fn tt_move_is_first() {
         let p = pos("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/2N5/PPPP1PPP/R1BQKBNR w KQkq - 2 3");
         let mut moves = p.legal_moves();
         let tables = OrderingTables::new();
         let tt = uci(&p, "d2d4");
-        order_moves(&mut moves, &p, &tables, tt);
+        order_moves(&mut moves, &p, &tables, tt, &params());
         assert_eq!(moves.get(0), tt);
     }
 
@@ -181,7 +191,16 @@ mod tests {
         let capture = uci(&p, "d4e5"); // Bxe5
         let killer = uci(&p, "a1a2");
         tables.killers.store(2, killer);
-        order_moves_ctx(&mut moves, &p, &tables, RawMove::NULL, 2, None, None);
+        order_moves_ctx(
+            &mut moves,
+            &p,
+            &tables,
+            RawMove::NULL,
+            2,
+            None,
+            None,
+            &params(),
+        );
 
         let cap_pos = moves.iter().position(|m| m == capture).unwrap();
         let killer_pos = moves.iter().position(|m| m == killer).unwrap();
@@ -199,7 +218,7 @@ mod tests {
         let p = Position::startpos();
         let mut moves = p.legal_moves();
         let tables = OrderingTables::new();
-        order_moves(&mut moves, &p, &tables, uci(&p, "e2e4"));
+        order_moves(&mut moves, &p, &tables, uci(&p, "e2e4"), &params());
         assert_eq!(moves.len(), 20);
         let mut sorted: Vec<_> = moves.iter().collect();
         sorted.sort_by_key(|m| m.raw());
@@ -217,7 +236,7 @@ mod tests {
             .history
             .update_history(p.turn(), good, history::bonus(12));
         let mut moves = p.legal_moves();
-        order_moves(&mut moves, &p, &tables, RawMove::NULL);
+        order_moves(&mut moves, &p, &tables, RawMove::NULL, &params());
         // g1f3 must precede a move we never rewarded (e.g. a2a3).
         let good_pos = moves.iter().position(|m| m == good).unwrap();
         let bad_pos = moves.iter().position(|m| m == uci(&p, "a2a3")).unwrap();
@@ -247,6 +266,7 @@ mod tests {
             0,
             Some(prev),
             None,
+            &params(),
         );
         let cm_pos = moves
             .iter()
@@ -273,8 +293,26 @@ mod tests {
             tables.history.update_capture(pawn_takes.board(), pm, 100);
             tables.history.update_capture(queen_takes.board(), qm, -100);
         }
-        let sq = score_move(&pawn_takes, pm, RawMove::NULL, &tables, 0, None, None);
-        let sk = score_move(&queen_takes, qm, RawMove::NULL, &tables, 0, None, None);
+        let sq = score_move(
+            &pawn_takes,
+            pm,
+            RawMove::NULL,
+            &tables,
+            0,
+            None,
+            None,
+            &params(),
+        );
+        let sk = score_move(
+            &queen_takes,
+            qm,
+            RawMove::NULL,
+            &tables,
+            0,
+            None,
+            None,
+            &params(),
+        );
         assert!(
             sk > sq,
             "capture history must never lift a pawn-victim capture above a \
@@ -294,8 +332,26 @@ mod tests {
         for _ in 0..1000 {
             tables.history.update_capture(p.board(), rook_cap, 100);
         }
-        let s_rook = score_move(&p, rook_cap, RawMove::NULL, &tables, 0, None, None);
-        let s_knight = score_move(&p, knight_cap, RawMove::NULL, &tables, 0, None, None);
+        let s_rook = score_move(
+            &p,
+            rook_cap,
+            RawMove::NULL,
+            &tables,
+            0,
+            None,
+            None,
+            &params(),
+        );
+        let s_knight = score_move(
+            &p,
+            knight_cap,
+            RawMove::NULL,
+            &tables,
+            0,
+            None,
+            None,
+            &params(),
+        );
         assert!(
             s_rook > s_knight,
             "capture history must decide same-victim ties in score_move: \

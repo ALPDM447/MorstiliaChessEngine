@@ -3,17 +3,20 @@
 use shakmaty::{Board, Color, Role};
 
 use crate::evaluation::Score;
+use crate::evaluation::params::EvalParams;
 
 /// Centipawn value of each piece, indexed directly by `Role as usize`
 /// (`Role::Pawn == 1` … `Role::King == 6`). The king has value 0 here
 /// (it is never traded); SEE includes a synthetic large king value.
+///
+/// Kept as a compatibility constant: the *tunable* values live in
+/// [`EvalParams::piece_values`] and default to exactly these numbers. The
+/// evaluation hot path reads the parameters, so a tuned material scale flows
+/// into SEE / MVV-LVA / delta pruning consistently.
 pub const PIECE_VALUES: [i32; 7] = [0, 100, 320, 330, 500, 900, 0];
 
-/// Bonus for having both bishops (tapered).
-const BISHOP_PAIR: Score = Score::new(40, 60);
-
-/// Material score (white minus black).
-pub fn evaluate_material(board: &Board) -> Score {
+/// Material score (white minus black), reading values from `p`.
+pub fn evaluate_material(board: &Board, p: &EvalParams) -> Score {
     let mut score = Score::zero();
     let mut white_bishops = 0i32;
     let mut black_bishops = 0i32;
@@ -28,8 +31,9 @@ pub fn evaluate_material(board: &Board) -> Score {
             Role::Queen,
         ] {
             let count = board.by_piece(role.of(color)).count() as i32;
-            score.mg += sign * count * PIECE_VALUES[role as usize];
-            score.eg += sign * count * PIECE_VALUES[role as usize];
+            let v = p.piece_value(role);
+            score.mg += sign * count * v;
+            score.eg += sign * count * v;
         }
         if board.by_piece(Role::Bishop.of(color)).count() >= 2 {
             if color == Color::White {
@@ -41,10 +45,11 @@ pub fn evaluate_material(board: &Board) -> Score {
     }
 
     if white_bishops != black_bishops {
+        let bp = p.bishop_pair_score();
         score += if white_bishops > black_bishops {
-            BISHOP_PAIR
+            bp
         } else {
-            -BISHOP_PAIR
+            -bp
         };
     }
     score
@@ -57,7 +62,7 @@ mod tests {
 
     fn eval_of(fen: &str) -> Score {
         let chess = crate::testutil::chess(fen);
-        evaluate_material(chess.board())
+        evaluate_material(chess.board(), &EvalParams::default())
     }
 
     #[test]

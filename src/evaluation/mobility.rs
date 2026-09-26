@@ -8,21 +8,16 @@
 
 use shakmaty::{Bitboard, Board, Color, Role, Square, attacks};
 
+use crate::evaluation::params::EvalParams;
 use crate::evaluation::{Score, pawns::PawnInfo};
 
-/// (midgame, endgame) centipawns per extra mobility square.
-fn mobility_weight(role: Role) -> (i32, i32) {
-    match role {
-        Role::Pawn => (0, 0),
-        Role::Knight => (4, 4),
-        Role::Bishop => (4, 5),
-        Role::Rook => (2, 3),
-        Role::Queen => (1, 2),
-        _ => (0, 1), // King (endgame only — a mobile king is a fighting piece)
-    }
+/// (midgame, endgame) centipawns per extra mobility square, read from `p`
+/// (roles 1..=5; the king's endgame-only activity lives in the same table).
+fn mobility_weight(p: &EvalParams, role: Role) -> (i32, i32) {
+    p.mobility_weight(role)
 }
 
-pub fn evaluate_mobility(board: &Board, info: &PawnInfo) -> Score {
+pub fn evaluate_mobility(board: &Board, info: &PawnInfo, p: &EvalParams) -> Score {
     let occupied = board.occupied();
     let mut score = Score::zero();
 
@@ -39,7 +34,7 @@ pub fn evaluate_mobility(board: &Board, info: &PawnInfo) -> Score {
             Role::Queen,
             Role::King,
         ] {
-            let (w_mg, w_eg) = mobility_weight(role);
+            let (w_mg, w_eg) = mobility_weight(p, role);
             board.by_piece(role.of(color)).for_each(|sq| {
                 let attack_bb = attacks_for(role, sq, occupied);
                 // Exclude own pieces. Minors also avoid enemy-pawn-attacked
@@ -79,30 +74,22 @@ mod tests {
     use super::*;
     use shakmaty::Position as _;
 
+    fn mob(fen: &str) -> Score {
+        let board = crate::testutil::chess(fen).board().clone();
+        evaluate_mobility(&board, &PawnInfo::scan(&board), &EvalParams::default())
+    }
+
     #[test]
     fn central_knight_is_more_mobile() {
-        let corner = crate::testutil::chess("6k1/8/8/8/8/8/8/N3K3 w - - 0 1")
-            .board()
-            .clone();
-        let center = crate::testutil::chess("6k1/8/8/8/3N4/8/8/4K3 w - - 0 1")
-            .board()
-            .clone();
-        let pi = PawnInfo::scan(&center);
-        let s_corner = evaluate_mobility(&corner, &PawnInfo::scan(&corner));
-        let s_center = evaluate_mobility(&center, &pi);
+        let s_corner = mob("6k1/8/8/8/8/8/8/N3K3 w - - 0 1");
+        let s_center = mob("6k1/8/8/8/3N4/8/8/4K3 w - - 0 1");
         assert!(s_center.mg > s_corner.mg);
     }
 
     #[test]
     fn blocked_knight_loses_mobility() {
-        let open = crate::testutil::chess("6k1/8/8/8/8/8/8/4K1N1 w - - 0 1")
-            .board()
-            .clone();
-        let blocked = crate::testutil::chess("6k1/8/8/8/8/8/PPPPPPPP/4K1N1 w - - 0 1")
-            .board()
-            .clone();
-        let s_open = evaluate_mobility(&open, &PawnInfo::scan(&open));
-        let s_blocked = evaluate_mobility(&blocked, &PawnInfo::scan(&blocked));
+        let s_open = mob("6k1/8/8/8/8/8/8/4K1N1 w - - 0 1");
+        let s_blocked = mob("6k1/8/8/8/8/8/PPPPPPPP/4K1N1 w - - 0 1");
         assert!(s_open.mg > s_blocked.mg);
     }
 
@@ -111,14 +98,8 @@ mod tests {
         // Same material (K vs K), the only difference is the white king's
         // position. A king in the centre has more mobility than one in the
         // corner — the endgame term must see it.
-        let corner = crate::testutil::chess("7k/8/8/8/8/8/8/K7 w - - 0 1")
-            .board()
-            .clone();
-        let central = crate::testutil::chess("7k/8/8/8/8/8/8/4K3 w - - 0 1")
-            .board()
-            .clone();
-        let s_corner = evaluate_mobility(&corner, &PawnInfo::scan(&corner));
-        let s_central = evaluate_mobility(&central, &PawnInfo::scan(&central));
+        let s_corner = mob("7k/8/8/8/8/8/8/K7 w - - 0 1");
+        let s_central = mob("7k/8/8/8/8/8/8/4K3 w - - 0 1");
         assert!(
             s_central.eg > s_corner.eg,
             "centralized king must have more endgame mobility: {s_central:?} vs {s_corner:?}"

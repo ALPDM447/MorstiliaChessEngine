@@ -72,6 +72,16 @@ pub struct SearchStats {
     pub probcut_cutoffs: u64,
     /// Captures skipped by delta pruning in quiescence.
     pub delta_pruned: u64,
+    /// Syzygy probes attempted at quiescence leaves (in-range only).
+    pub tb_probes: u64,
+    /// Probes that produced a tablebase verdict.
+    pub tb_hits: u64,
+    /// Leaves resolved to an unconditional win / draw / loss.
+    pub tb_wins: u64,
+    pub tb_draws: u64,
+    pub tb_losses: u64,
+    /// Leaves resolved to a cursed win or blessed loss (50-move sensitive).
+    pub tb_cursed: u64,
 }
 
 impl SearchStats {
@@ -99,6 +109,12 @@ impl SearchStats {
         self.probcut_attempts += other.probcut_attempts;
         self.probcut_cutoffs += other.probcut_cutoffs;
         self.delta_pruned += other.delta_pruned;
+        self.tb_probes += other.tb_probes;
+        self.tb_hits += other.tb_hits;
+        self.tb_wins += other.tb_wins;
+        self.tb_draws += other.tb_draws;
+        self.tb_losses += other.tb_losses;
+        self.tb_cursed += other.tb_cursed;
     }
 
     /// Share of probes that found an entry, `0..=100`.
@@ -207,6 +223,12 @@ mod tests {
             probcut_attempts: 5,
             probcut_cutoffs: 2,
             delta_pruned: 1,
+            tb_probes: 40,
+            tb_hits: 36,
+            tb_wins: 10,
+            tb_draws: 20,
+            tb_losses: 4,
+            tb_cursed: 2,
         };
         let b = SearchStats {
             qsearch_nodes: 5,
@@ -230,6 +252,12 @@ mod tests {
             probcut_attempts: 3,
             probcut_cutoffs: 1,
             delta_pruned: 0,
+            tb_probes: 12,
+            tb_hits: 10,
+            tb_wins: 3,
+            tb_draws: 5,
+            tb_losses: 1,
+            tb_cursed: 1,
         };
         a.add(&b);
         assert_eq!(a.qsearch_nodes, 15);
@@ -239,6 +267,13 @@ mod tests {
         assert_eq!(a.null_probes, 11);
         assert_eq!(a.lmr_researched, 8);
         assert_eq!(a.probcut_cutoffs, 3);
+        // Tablebase counters merge like every other counter family.
+        assert_eq!(a.tb_probes, 52);
+        assert_eq!(a.tb_hits, 46);
+        assert_eq!(a.tb_wins, 13);
+        assert_eq!(a.tb_draws, 25);
+        assert_eq!(a.tb_losses, 5);
+        assert_eq!(a.tb_cursed, 3);
     }
 
     #[test]

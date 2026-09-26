@@ -2,12 +2,44 @@
 //!
 //! Tables are given for White on square indices `A1 == 0 … H8 == 63` and
 //! mirrored (vertically) for Black. Positive values favour White.
+//!
+//! Since Stage 5 the concrete tables live in [`crate::evaluation::EvalParams`]
+//! (tunable, serialized to `config/baseline_eval.toml`); this module only
+//! supplies the legacy default tables ([`LEGACY_PST`]) that the default
+//! parameter set is built from.
 
 use shakmaty::{Board, Color, Role, Square};
 
 use crate::evaluation::Score;
+use crate::evaluation::params::EvalParams;
 
 type Table = [i16; 64];
+
+/// The pre-Stage-5 PST constants, exposed so [`EvalParams::default`] can build
+/// a byte-identical baseline. `pawn_mg`/`pawn_eg` and `king_mg`/`king_eg` are
+/// phase-specific; knights/bishops/rooks/queens share one table (legacy
+/// convention, now tunable independently per phase).
+pub(crate) struct LegacyPst {
+    pub pawn_mg: Table,
+    pub pawn_eg: Table,
+    pub knight: Table,
+    pub bishop: Table,
+    pub rook: Table,
+    pub queen: Table,
+    pub king_mg: Table,
+    pub king_eg: Table,
+}
+
+pub(crate) const LEGACY_PST: LegacyPst = LegacyPst {
+    pawn_mg: PAWN_MG,
+    pawn_eg: PAWN_EG,
+    knight: KNIGHT_MG,
+    bishop: BISHOP_MG,
+    rook: ROOK_MG,
+    queen: QUEEN_MG,
+    king_mg: KING_MG,
+    king_eg: KING_EG,
+};
 
 /// Pawn PSTs. Values are in centipawns; index 0 = rank 1 file a … 63 = rank 8.
 const PAWN_MG: Table = [
@@ -60,12 +92,6 @@ const KING_EG: Table = [
     -50, -50,
 ];
 
-/// Minors/rooks/queens use the same table for midgame and endgame (the
-/// simplified-evaluation convention).
-fn king_eg_table() -> Table {
-    KING_EG
-}
-
 /// Returns the PST index for `sq` seen from `color`'s point of view.
 #[inline]
 fn table_index(sq: Square, color: Color) -> usize {
@@ -76,8 +102,9 @@ fn table_index(sq: Square, color: Color) -> usize {
     }
 }
 
-/// Piece-square score for the whole board (white minus black).
-pub fn evaluate_pst(board: &Board) -> Score {
+/// Piece-square score for the whole board (white minus black), reading the
+/// tunable tables from `p` (roles 1..=6, phase 0 = mg / 1 = eg).
+pub fn evaluate_pst(board: &Board, p: &EvalParams) -> Score {
     let mut score = Score::zero();
     for color in [Color::White, Color::Black] {
         let sign = if color == Color::White { 1 } else { -1 };
@@ -89,18 +116,11 @@ pub fn evaluate_pst(board: &Board) -> Score {
             Role::Queen,
             Role::King,
         ] {
-            let (mg, eg): (&Table, Table) = match role {
-                Role::Pawn => (&PAWN_MG, PAWN_EG),
-                Role::Knight => (&KNIGHT_MG, KNIGHT_MG),
-                Role::Bishop => (&BISHOP_MG, BISHOP_MG),
-                Role::Rook => (&ROOK_MG, ROOK_MG),
-                Role::Queen => (&QUEEN_MG, QUEEN_MG),
-                Role::King => (&KING_MG, king_eg_table()),
-            };
             board.by_piece(role.of(color)).for_each(|sq| {
                 let idx = table_index(sq, color);
-                score.mg += sign * i32::from(mg[idx]);
-                score.eg += sign * i32::from(eg[idx]);
+                let r = role as usize;
+                score.mg += sign * p.pst.tables[r][0][idx];
+                score.eg += sign * p.pst.tables[r][1][idx];
             });
         }
     }
@@ -110,22 +130,19 @@ pub fn evaluate_pst(board: &Board) -> Score {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evaluation::params::pst_from;
     use shakmaty::Position as _;
+
+    fn pst_of(fen: &str) -> Score {
+        let board = crate::testutil::chess(fen).board().clone();
+        evaluate_pst(&board, &EvalParams::default())
+    }
 
     #[test]
     fn centered_knight_beats_corner_knight() {
-        let a = crate::testutil::chess("6k1/8/8/8/8/8/8/4K3 w - - 0 1")
-            .board()
-            .clone();
-        let b = crate::testutil::chess("6k1/8/8/8/3N4/8/8/4K3 w - - 0 1")
-            .board()
-            .clone();
-        let corner = crate::testutil::chess("6k1/8/8/8/8/8/8/N3K3 w - - 0 1")
-            .board()
-            .clone();
-        let s_center = evaluate_pst(&b);
-        let s_corner = evaluate_pst(&corner);
-        let s_none = evaluate_pst(&a);
+        let s_center = pst_of("6k1/8/8/8/3N4/8/8/4K3 w - - 0 1");
+        let s_corner = pst_of("6k1/8/8/8/8/8/8/N3K3 w - - 0 1");
+        let s_none = pst_of("6k1/8/8/8/8/8/8/4K3 w - - 0 1");
         assert!(s_center.mg > s_corner.mg);
         assert!(s_center.mg > s_none.mg);
     }
@@ -134,15 +151,42 @@ mod tests {
     fn pst_black_mirror_negates() {
         // A position and its true color mirror (colors swapped + board
         // flipped vertically) must produce opposite PST values.
-        let w = crate::testutil::chess("6k1/8/8/8/4P3/8/4N3/4K3 w - - 0 1")
-            .board()
-            .clone();
-        let m = crate::testutil::chess("4k3/4n3/8/4p3/8/8/8/6K1 b - - 0 1")
-            .board()
-            .clone();
-        let s_w = evaluate_pst(&w);
-        let s_m = evaluate_pst(&m);
+        let s_w = pst_of("6k1/8/8/8/4P3/8/4N3/4K3 w - - 0 1");
+        let s_m = pst_of("4k3/4n3/8/4p3/8/8/8/6K1 b - - 0 1");
         assert_eq!(s_w.mg, -s_m.mg);
         assert_eq!(s_w.eg, -s_m.eg);
+    }
+
+    /// The default PST tables must reproduce the legacy const tables exactly
+    /// (the whole point of the `LEGACY_PST` derivation).
+    #[test]
+    fn default_pst_match_legacy_tables() {
+        let legacy = LEGACY_PST;
+        let p = EvalParams::default();
+        assert_eq!(
+            p.pst.tables[Role::Pawn as usize][0],
+            pst_from(&legacy.pawn_mg)
+        );
+        assert_eq!(
+            p.pst.tables[Role::Pawn as usize][1],
+            pst_from(&legacy.pawn_eg)
+        );
+        for (role, table) in [
+            (Role::Knight, legacy.knight),
+            (Role::Bishop, legacy.bishop),
+            (Role::Rook, legacy.rook),
+            (Role::Queen, legacy.queen),
+        ] {
+            assert_eq!(p.pst.tables[role as usize][0], pst_from(&table));
+            assert_eq!(p.pst.tables[role as usize][1], pst_from(&table));
+        }
+        assert_eq!(
+            p.pst.tables[Role::King as usize][0],
+            pst_from(&legacy.king_mg)
+        );
+        assert_eq!(
+            p.pst.tables[Role::King as usize][1],
+            pst_from(&legacy.king_eg)
+        );
     }
 }

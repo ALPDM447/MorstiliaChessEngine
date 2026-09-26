@@ -13,7 +13,7 @@
 
 use shakmaty::{Bitboard, Board, Color, Role, Square};
 
-use crate::evaluation::material::PIECE_VALUES;
+use crate::evaluation::params::EvalParams;
 use crate::types::RawMove;
 
 /// Returns the SEE of a capture/promotion move, or 0 for quiet moves.
@@ -31,7 +31,10 @@ use crate::types::RawMove;
 /// * A retrograde minimax walks the list backwards — a side only continues
 ///   the exchange if it is profitable — and the last speculative entry is
 ///   discarded; `swap[0]` is the result, positive for the mover.
-pub fn see(board: &Board, m: RawMove) -> i32 {
+///
+/// Material values are read from the tunable `p` so SEE stays consistent with
+/// the evaluation ('p' is the searcher's shared parameter set).
+pub fn see(board: &Board, m: RawMove, p: &EvalParams) -> i32 {
     let from = m.from();
     let to = m.to();
 
@@ -60,23 +63,23 @@ pub fn see(board: &Board, m: RawMove) -> i32 {
     }
 
     let promo = m.promotion();
-    let pawn_value = PIECE_VALUES[Role::Pawn as usize];
+    let pawn_value = p.piece_value(Role::Pawn);
     let victim = if m.is_en_passant() {
         pawn_value
     } else {
         match board.role_at(to) {
-            Some(role) => PIECE_VALUES[role as usize],
+            Some(role) => p.piece_value(role),
             None => 0,
         }
     };
 
     // swap[0]: net material gained by the initial capture.
     let mut swap = [0i32; 32];
-    swap[0] = victim + promo.map_or(0, |r| PIECE_VALUES[r as usize] - pawn_value);
+    swap[0] = victim + promo.map_or(0, |r| p.piece_value(r) - pawn_value);
 
     // The value the first responder would win by recapturing the piece the
     // mover just placed on `to` (its promoted form, if any).
-    let mut occupant = promo.map_or(PIECE_VALUES[moving as usize], |r| PIECE_VALUES[r as usize]);
+    let mut occupant = promo.map_or(p.piece_value(moving), |r| p.piece_value(r));
 
     let mut attackers = attacks_to(board, to, occ);
     // The mover itself cannot act as a recapturer.
@@ -99,7 +102,7 @@ pub fn see(board: &Board, m: RawMove) -> i32 {
         attackers = (attackers & !Bitboard::from_square(sq)) | attacks_to(board, to, occ);
 
         swap[idx] = occupant - swap[idx - 1];
-        occupant = PIECE_VALUES[role as usize];
+        occupant = p.piece_value(role);
         idx += 1;
         stm = !stm;
     }
@@ -147,8 +150,8 @@ fn least_valuable_attacker(
 /// Convenience wrapper: is this capture winning enough to be worth searching
 /// in quiescence (`see >= threshold` relative to position value)?
 #[inline]
-pub fn see_ge(board: &Board, m: RawMove, threshold: i32) -> bool {
-    see(board, m) >= threshold
+pub fn see_ge(board: &Board, m: RawMove, threshold: i32, p: &EvalParams) -> bool {
+    see(board, m, p) >= threshold
 }
 
 #[cfg(test)]
@@ -156,10 +159,14 @@ mod tests {
     use super::*;
     use crate::board::Position;
 
+    fn params() -> EvalParams {
+        EvalParams::default()
+    }
+
     fn sees(fen: &str, uci: &str) -> i32 {
         let pos = Position::from_fen(fen).unwrap();
         let m = pos.raw_move_from_uci(uci).unwrap();
-        see(pos.board(), m)
+        see(pos.board(), m, &params())
     }
 
     #[test]

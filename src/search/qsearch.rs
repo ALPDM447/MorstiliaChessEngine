@@ -18,8 +18,7 @@ use shakmaty::Role;
 use shakmaty::zobrist::Zobrist64;
 
 use crate::board::Position;
-use crate::evaluation::Evaluator;
-use crate::evaluation::material::PIECE_VALUES;
+use crate::evaluation::EvalParams;
 use crate::move_ordering::history::MoveCtx;
 use crate::move_ordering::{order_moves_ctx, tt_move::victim_value};
 use crate::search::pruning::DELTA_MARGIN;
@@ -27,12 +26,14 @@ use crate::search::{SearchShared, SearchThread, is_draw};
 use crate::types::{MAX_PLY, RawMove, mated_in};
 
 /// The value a capture "touches" for delta pruning: the captured piece (a
-/// pawn for en passant) plus any promotion surplus.
+/// pawn for en passant) plus any promotion surplus. Reads the *tunable*
+/// material values (`p`) so delta pruning stays consistent with SEE and the
+/// evaluation under any parameter set.
 #[inline]
-fn touched_value(pos: &Position, m: RawMove) -> i32 {
-    let victim = victim_value(pos.board(), m);
+fn touched_value(pos: &Position, m: RawMove, p: &EvalParams) -> i32 {
+    let victim = victim_value(pos.board(), m, p);
     match m.promotion() {
-        Some(role) => victim + PIECE_VALUES[role as usize] - PIECE_VALUES[Role::Pawn as usize],
+        Some(role) => victim + p.piece_value(role) - p.piece_value(Role::Pawn),
         None => victim,
     }
 }
@@ -52,28 +53,43 @@ pub fn qsearch(
     }
     thread.stats.qsearch_nodes += 1;
     if ply >= MAX_PLY - 1 {
-        return Evaluator.evaluate(pos);
+        return thread.evaluate_at(pos, shared, ply);
     }
 
     let in_check = pos.is_check();
-    let static_eval = Evaluator.evaluate(pos);
+    let static_eval = thread.evaluate_at(pos, shared, ply);
     let mut moves = if in_check {
         pos.legal_moves()
     } else {
         pos.capture_moves()
     };
+    if moves.is_empty() && in_check {
+        // Checkmate: keep the real mate distance — a tablebase verdict here
+        // would flatten it to a mere "loss".
+        return mated_in(ply as i32);
+    }
     if moves.is_empty() {
-        // Checkmate, or simply nothing worth capturing: stand pat at the
-        // static evaluation instead of pretending the position is drawn.
-        return if in_check {
-            mated_in(ply as i32)
-        } else {
-            static_eval
-        };
+        // Nothing worth capturing: a quiet leaf. A definitive tablebase
+        // verdict supersedes the stand-pat evaluation (for every non-TB
+        // position the probe is a no-op and this path returns exactly what
+        // it did before); otherwise stand pat at the static evaluation
+        // instead of pretending the position is drawn.
+        if let Some(score) = shared.probe_tb(pos, thread) {
+            return score;
+        }
+        return static_eval;
     }
 
     if is_draw(pos, thread, history, ply) {
         return 0;
+    }
+
+    // Syzygy: an exact outcome ends the leaf. Runs after the draw checks
+    // (the 50-move rule and insufficient material already resolved the
+    // position) and before the stand-pat, so a tablebase win/loss is
+    // preferred over the static evaluation. Checkmate was handled above.
+    if let Some(score) = shared.probe_tb(pos, thread) {
+        return score;
     }
 
     // Stand pat: the position's static value alone caps the downside.
@@ -94,7 +110,16 @@ pub fn qsearch(
         .tt
         .probe_move(pos.hash.into())
         .unwrap_or(RawMove::NULL);
-    order_moves_ctx(&mut moves, pos, &thread.tables, tt_move, ply, prev, ant);
+    order_moves_ctx(
+        &mut moves,
+        pos,
+        &thread.tables,
+        tt_move,
+        ply,
+        prev,
+        ant,
+        &shared.params,
+    );
 
     for i in 0..moves.len() {
         if thread.stopped {
@@ -103,7 +128,7 @@ pub fn qsearch(
         let m = moves.get(i);
 
         // Delta pruning: the capture cannot possibly reach near alpha.
-        if !in_check && best + touched_value(pos, m) + DELTA_MARGIN <= alpha {
+        if !in_check && best + touched_value(pos, m, &shared.params) + DELTA_MARGIN <= alpha {
             thread.stats.delta_pruned += 1;
             continue;
         }
@@ -111,13 +136,13 @@ pub fn qsearch(
         // not a way out of the quiet-move tail.
         if !in_check {
             thread.stats.see_calls += 1;
-            if crate::move_ordering::see::see(pos.board(), m) < 0 {
+            if crate::move_ordering::see::see(pos.board(), m, &shared.params) < 0 {
                 thread.stats.see_pruned += 1;
                 continue;
             }
         }
 
-        let child = pos.make_child(m);
+        let child = thread.make_child(pos, m, shared, ply + 1);
         thread.ctx[ply + 1] = MoveCtx::of(pos, m);
         let score = -qsearch(&child, -beta, -alpha, ply + 1, shared, thread, history);
         if score > best {
@@ -137,18 +162,24 @@ pub fn qsearch(
 mod tests {
     use super::*;
     use crate::board::Position;
+    use crate::evaluation::Evaluator;
     use crate::search::{SearchShared, SearchThread};
-    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
 
     fn q(fen: &str) -> i32 {
         let pos = Position::from_fen(fen).unwrap();
-        let stop = AtomicBool::new(false);
-        let empty_tt = crate::tt::TranspositionTable::new(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let empty_tt = Arc::new(crate::tt::TranspositionTable::new(1));
+        let default_params = Arc::new(crate::evaluation::EvalParams::default());
         let shared = SearchShared {
-            tt: &empty_tt,
-            stop: &stop,
-            nodes: std::sync::atomic::AtomicU64::new(0),
+            tt: empty_tt,
+            params: default_params,
+            stop,
+            nodes: Arc::new(AtomicU64::new(0)),
             node_cap: None,
+            tb: Arc::new(crate::endgame::Syzygy::none()),
+            nnue: None,
         };
         let mut thread = SearchThread::new();
         qsearch(&pos, -32_001, 32_001, 0, &shared, &mut thread, &[])
@@ -158,13 +189,17 @@ mod tests {
     /// delta-prune counter so delta boundaries can be tested deterministically.
     fn q_window(fen: &str, alpha: i32, beta: i32) -> (i32, u64) {
         let pos = Position::from_fen(fen).unwrap();
-        let stop = AtomicBool::new(false);
-        let empty_tt = crate::tt::TranspositionTable::new(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let empty_tt = Arc::new(crate::tt::TranspositionTable::new(1));
+        let default_params = Arc::new(crate::evaluation::EvalParams::default());
         let shared = SearchShared {
-            tt: &empty_tt,
-            stop: &stop,
-            nodes: std::sync::atomic::AtomicU64::new(0),
+            tt: empty_tt,
+            params: default_params,
+            stop,
+            nodes: Arc::new(AtomicU64::new(0)),
             node_cap: None,
+            tb: Arc::new(crate::endgame::Syzygy::none()),
+            nnue: None,
         };
         let mut thread = SearchThread::new();
         let v = qsearch(&pos, alpha, beta, 0, &shared, &mut thread, &[]);
@@ -235,5 +270,70 @@ mod tests {
             Evaluator.evaluate(&Position::from_fen("4k3/8/8/8/3P4/8/8/4K1b1 b - - 0 1").unwrap());
         assert_eq!(delta_pruned, 1, "the only capture must be delta-pruned");
         assert_eq!(v, stand_pat, "stand pat: the capture was skipped");
+    }
+
+    // --- Syzygy -------------------------------------------------------------
+
+    /// Like `q` but with the real 3/4-piece tables from `tests/data/syzygy`
+    /// loaded, returning `(score, &thread.stats)` so TB counters can be
+    /// asserted too.
+    fn q_tb(fen: &str) -> (i32, crate::search::stats::SearchStats) {
+        let pos = Position::from_fen(fen).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let empty_tt = Arc::new(crate::tt::TranspositionTable::new(1));
+        let default_params = Arc::new(crate::evaluation::EvalParams::default());
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/syzygy");
+        let (tb, report) = crate::endgame::Syzygy::load(dir.to_str().unwrap());
+        assert_eq!(report.max_pieces, 4, "tables must be present for this test");
+        let shared = SearchShared {
+            tt: empty_tt,
+            params: default_params,
+            stop,
+            nodes: Arc::new(AtomicU64::new(0)),
+            node_cap: None,
+            tb: Arc::new(tb),
+            nnue: None,
+        };
+        let mut thread = SearchThread::new();
+        let v = qsearch(&pos, -32_001, 32_001, 0, &shared, &mut thread, &[]);
+        (v, thread.stats)
+    }
+
+    #[test]
+    fn tablebase_win_outranks_the_quiet_stand_pat() {
+        // A *quiet* leaf — no captures at all — so the old code would have
+        // stood pat at the static evaluation; the Syzygy verdict must
+        // override it with the exact win band. The quiet path is the one
+        // that demands the probe before the stand-pat return.
+        let (v, stats) = q_tb("4k3/8/8/8/8/8/8/3QK3 w - - 0 1");
+        assert_eq!(v, 19_999, "unconditional TB win band");
+        assert!(stats.tb_probes >= 1);
+        assert!(stats.tb_hits >= 1);
+        assert!(stats.tb_wins >= 1);
+    }
+
+    #[test]
+    fn tablebase_loss_resolves_the_leaf() {
+        let (v, stats) = q_tb("4k3/8/8/8/8/8/8/3QK3 b - - 0 1");
+        assert_eq!(v, -19_999, "unconditional TB loss band (win-symmetric)");
+        assert!(stats.tb_losses >= 1, "loss counter must increment");
+    }
+
+    #[test]
+    fn tablebase_checkmate_still_returns_a_mate_score() {
+        // Black is checkmated (Kg6 + Qg7 vs Kh8): qsearch must return the
+        // real mate distance, never a mere tablebase "loss" (-20000).
+        let (v, _) = q_tb("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1");
+        assert!(
+            v < -20_000 && v > -32_001,
+            "checkmate must keep its mate score: got {v}"
+        );
+    }
+
+    #[test]
+    fn tablebase_draw_leaf_scores_zero() {
+        let (v, stats) = q_tb("4k2r/8/8/8/8/8/8/3RK3 w - - 0 1");
+        assert_eq!(v, 0, "KRvKR draw");
+        assert!(stats.tb_draws >= 1, "draw counter must increment");
     }
 }
