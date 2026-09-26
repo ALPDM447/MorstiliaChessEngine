@@ -205,3 +205,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Network and opening book (too large for git; shipped separately)
+nnue/*.nnue
+book/*.bin
