@@ -92,14 +92,20 @@ pub fn qsearch(
         return score;
     }
 
-    // Stand pat: the position's static value alone caps the downside.
-    if static_eval >= beta {
-        return static_eval;
-    }
-    if static_eval > alpha {
-        alpha = static_eval;
-    }
-    let mut best = static_eval;
+    // Stand pat: the position's static value alone caps the downside. Not in
+    // check: passing is illegal there, so the score is the best evasion's and
+    // starts from being mated, never from the static evaluation.
+    let mut best = if in_check {
+        mated_in(ply as i32)
+    } else {
+        if static_eval >= beta {
+            return static_eval;
+        }
+        if static_eval > alpha {
+            alpha = static_eval;
+        }
+        static_eval
+    };
 
     let prev = thread.ctx[ply];
     let ant = thread.ctx[ply.saturating_sub(1)];
@@ -231,6 +237,18 @@ mod tests {
         // stand-pat would leave black down a rook.
         let v = q("4k2R/8/8/8/8/8/8/4K3 b - - 0 1");
         assert!(v < 0, "white is up a rook: got {v}");
+    }
+
+    #[test]
+    fn in_check_never_stands_pat() {
+        // The white knight on c7 checks the black king and forks the queen on
+        // a8. Black is statically a queen up, but every evasion drops the
+        // queen, so the score must come from the evasions, not the stand-pat.
+        let fen = "q3k3/2N5/8/8/8/8/7P/6K1 b - - 0 1";
+        let stand_pat = Evaluator.evaluate(&Position::from_fen(fen).unwrap());
+        let v = q(fen);
+        assert!(stand_pat > 0, "black is statically ahead: got {stand_pat}");
+        assert!(v < 0, "the fork wins the queen: got {v}");
     }
 
     #[test]

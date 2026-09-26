@@ -180,7 +180,7 @@ impl SearchStats {
             + self.see_pruned
             + self.delta_pruned
             + self.rfp_pruned
-            + self.razor_attempts
+            + self.razor_cutoffs
             + self.null_cutoffs
             + self.probcut_cutoffs
     }
@@ -312,7 +312,7 @@ mod tests {
         assert_eq!(s.probcut_cutoff_pct(), 100.0 / 3.0);
         assert_eq!(
             s.total_pruned(),
-            30 + 5 + 25 + 7 + 4 + 10 + 8 + 2,
+            30 + 5 + 25 + 7 + 4 + 6 + 8 + 2,
             "every prune family must be included exactly once"
         );
     }

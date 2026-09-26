@@ -134,7 +134,8 @@ pub fn alphabeta(
     // Razoring: shallow and hopeless — drop straight into quiescence; no
     // quiet move can recover a deficit this large. A "successful" razor is
     // one whose qsearch confirms the fail-low (`score <= alpha`); the node
-    // was resolved without the quiet-move subtree.
+    // was resolved without the quiet-move subtree. Otherwise the full search
+    // runs, since qsearch never tries the quiet checks that might still win.
     if !pv_node
         && !in_check
         && depth <= pruning::RAZOR_DEPTH
@@ -146,8 +147,8 @@ pub fn alphabeta(
         let razor_score = qsearch::qsearch(pos, alpha, beta, ply, shared, thread, history);
         if razor_score <= alpha {
             thread.stats.razor_cutoffs += 1;
+            return razor_score;
         }
-        return razor_score;
     }
 
     // Null-move pruning: pass, and if the opponent still cannot beat beta
@@ -263,6 +264,12 @@ pub fn alphabeta(
         let is_tactical = is_capture_or_promotion(pos.board(), m);
 
         // --- Pruning (only below the root of the local window) ---
+        // None of these skips a checking move: a quiet check or a checking
+        // sacrifice can start a forced line the static view cannot see. The
+        // check test plays the move on a scratch copy, so it only runs once a
+        // pruning condition has already fired, and at most once per move.
+        let mut gives_check = None;
+        let mut gives_check = || *gives_check.get_or_insert_with(|| pos.make_child(m).is_check());
 
         // Futility: a quiet move cannot lift the static position to alpha.
         if !pv_node
@@ -271,6 +278,7 @@ pub fn alphabeta(
             && depth <= pruning::FUTILITY_DEPTH
             && searched > 0
             && static_eval + pruning::futility_margin(depth, improving) <= alpha
+            && !gives_check()
         {
             thread.stats.futility_pruned += 1;
             continue;
@@ -280,7 +288,7 @@ pub fn alphabeta(
         if !pv_node && !in_check && is_tactical {
             thread.stats.see_calls += 1;
             let see_v = see::see(pos.board(), m, &shared.params);
-            if see_v < pruning::see_prune_threshold(depth) {
+            if see_v < pruning::see_prune_threshold(depth) && !gives_check() {
                 thread.stats.see_pruned += 1;
                 continue;
             }
@@ -293,6 +301,7 @@ pub fn alphabeta(
             && depth <= 6
             && searched >= pruning::QUIET_PRUNE_LIMIT
             && thread.tables.history.history_score(pos.turn(), m) < pruning::HISTORY_PRUNE_THRESHOLD
+            && !gives_check()
         {
             thread.stats.history_pruned += 1;
             continue;
