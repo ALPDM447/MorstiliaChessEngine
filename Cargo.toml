@@ -3,7 +3,7 @@ name = "morstilia"
 version = "7.0.0"
 edition = "2024"
 description = "A strong classical UCI chess engine built on shakmaty"
-license = "MIT"
+license = "GPL-3.0-or-later"
 build = "build.rs"
 
 [dependencies]

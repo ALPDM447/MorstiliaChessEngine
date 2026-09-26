@@ -18,6 +18,7 @@ Chess rules and move generation come from
   give check. Razoring now returns only when quiescence confirms the fail-low,
   so quiet checks at shallow depth are still searched. Before the fix the
   engine could miss forced lines and hang pieces after a check.
+* **License changed to GPL-3.0**, to match the embedded Stockfish net.
 
 Informal check against Morstilia 6.0.0: 20 games at 10+0.1, one thread,
 16 MB hash, books off, ten openings with colours swapped. Morstilia 7 with
@@ -167,10 +168,17 @@ cargo bench
 
 ## License
 
-Morstilia's source code is under the MIT license (see `LICENSE`).
+Copyright (C) 2026 Alp Dumlupınar
 
-The NNUE network `nn-1a298aa575a0.nnue` was trained by the Stockfish
-developers and is distributed under the GNU General Public License v3.0.
-Binaries that embed it are subject to the GPL-3.0 as well. See
-[Stockfish](https://github.com/official-stockfish/Stockfish) for the license
-text and authors.
+Morstilia is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. It is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See `LICENSE` for the full text.
+
+Versions up to 6.0.0 were released under the MIT license.
+
+The NNUE network `nn-1a298aa575a0.nnue` was trained by the
+[Stockfish](https://github.com/official-stockfish/Stockfish) developers and
+is used under the GNU General Public License v3.0.
