@@ -87,8 +87,8 @@ impl UciEngine {
         // to stderr — never into the UCI stdout stream.
         let (syzygy, tb_report) = load_syzygy(&config.syzygy_path);
         write_syzygy_report(&tb_report);
-        // NNUE: the default config asks for the classical evaluator, so this is
-        // a no-op for a stock engine. Decoding the 100 MB of LEB128 into
+        // NNUE: the default evaluator, loaded from the embedded net unless
+        // `NNUEFile` names another. Decoding the 100 MB of LEB128 into
         // resident weights costs ~0.25 s (release) / ~2 s (debug), so it
         // happens once here and never per search.
         let nnue = load_nnue(&mut config);

@@ -21,9 +21,9 @@ pub const DEFAULT_SEARCH_DEPTH: i32 = 0;
 #[serde(rename_all = "lowercase")]
 pub enum EvalMode {
     /// The hand-written evaluation ([`crate::evaluation`]).
-    #[default]
     Classical,
     /// The real Stockfish 19 NNUE net (see [`crate::nnue`]).
+    #[default]
     Nnue,
 }
 
@@ -90,7 +90,7 @@ impl Default for EngineConfig {
             book_path: String::new(),
             syzygy_path: String::new(),
             eval_params_path: String::new(),
-            eval: EvalMode::Classical,
+            eval: EvalMode::Nnue,
             nnue_path: String::new(),
             multi_pv: 1,
             ponder: false,
@@ -252,7 +252,7 @@ mod tests {
         assert_eq!(c.hash_mb, 64);
         assert_eq!(c.threads, 1);
         assert!(c.book_enabled);
-        assert_eq!(c.eval, EvalMode::Classical, "classical is the safe default");
+        assert_eq!(c.eval, EvalMode::Nnue, "the embedded net is the default");
         assert!(c.nnue_path.is_empty());
     }
 
@@ -317,7 +317,7 @@ mod tests {
         // currently set to.
         let eval = log.iter().find(|l| l.contains("name Eval ")).unwrap();
         assert!(eval.contains("type combo"), "{eval}");
-        assert!(eval.contains("default classical"), "{eval}");
+        assert!(eval.contains("default nnue"), "{eval}");
         assert!(eval.contains("var NNUE"), "{eval}");
         let file = log.iter().find(|l| l.contains("name NNUEFile")).unwrap();
         assert!(file.contains("type string"), "{file}");

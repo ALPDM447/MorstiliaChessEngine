@@ -789,11 +789,11 @@ fn the_uci_handshake_advertises_the_eval_options() {
         .lines()
         .find(|l| l.starts_with("option name Eval "))
         .unwrap_or_else(|| panic!("no Eval option in: {out}"));
-    // Pinned whole: a GUI parses this line, and `classical` has to be the
-    // default so an engine with no net installed behaves exactly as before.
+    // Pinned whole: a GUI parses this line, and the embedded net is the
+    // default.
     assert_eq!(
         line,
-        "option name Eval type combo default classical var Classical var classical var NNUE var nnue"
+        "option name Eval type combo default nnue var Classical var classical var NNUE var nnue"
     );
     assert!(
         out.lines()
@@ -832,7 +832,13 @@ fn a_missing_net_over_uci_falls_back_to_classical_and_keeps_playing() {
     // way. Identical score, identical node count, identical bestmove to a run
     // that never asked for NNUE. The test includes "isready" -> "readyok", so
     // the plain comparison should also include isready.
-    let (plain, _) = drive_uci_capturing(&["isready", &position(KIWIPETE), "go depth 8", "quit"]);
+    let (plain, _) = drive_uci_capturing(&[
+        "setoption name Eval value classical",
+        "isready",
+        &position(KIWIPETE),
+        "go depth 8",
+        "quit",
+    ]);
     assert_eq!(
         normalized(&out),
         normalized(&plain),
@@ -907,7 +913,12 @@ fn switching_back_to_classical_mid_session_takes_effect() {
     assert_ne!(scores[0], scores[1], "the switch had no effect: {out}");
 
     // The second run is the plain classical one, down to the node count.
-    let (plain, plain_err) = drive_uci_capturing(&[&position(KIWIPETE), "go depth 8", "quit"]);
+    let (plain, plain_err) = drive_uci_capturing(&[
+        "setoption name Eval value classical",
+        &position(KIWIPETE),
+        "go depth 8",
+        "quit",
+    ]);
     // Get the LAST "info depth 8" line (the second search after switching to classical)
     let last_depth8 = |s: &str| {
         s.lines()
@@ -947,6 +958,7 @@ fn one_thread_nnue_search_is_reproducible_over_uci() {
     // And it is not accidentally the classical search.
     let (plain, _) = drive_uci_capturing(&[
         NO_BOOK,
+        "setoption name Eval value classical",
         "setoption name Threads value 1",
         "ucinewgame",
         &position(KIWIPETE),
