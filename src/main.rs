@@ -40,8 +40,8 @@ Usage:
   morstilia --version                    print engine identity
 
 Evaluators:
-  --eval classical   the hand-written evaluation (default; always available)
-  --eval nnue        the Stockfish 19 net in nnue/nn-1a298aa575a0.nnue
+  --eval nnue        the Stockfish 19 net embedded in the binary (default)
+  --eval classical   the hand-written evaluation
   --nnue FILE        use a different .nnue net. Unlike over UCI, a broken or
                      missing net is a hard error here: an explicit --eval nnue
                      on the command line must not silently run something else.
@@ -152,7 +152,7 @@ fn cmd_search(args: &[String], i: usize) -> anyhow::Result<()> {
     let mut hash = DEFAULT_HASH_MB;
     let mut params_path: Option<String> = None;
     let mut syzygy: Option<String> = None;
-    let mut eval = EvalMode::Classical;
+    let mut eval = EvalMode::Nnue;
     let mut net_path: Option<String> = None;
     while j < args.len() {
         let flag = args[j].clone();
@@ -197,8 +197,8 @@ fn cmd_search(args: &[String], i: usize) -> anyhow::Result<()> {
 /// gets classical evaluation back has a broken install and keeps playing; a
 /// user who typed `--eval nnue` on a command line and sees classical scores
 /// would have no way to tell. So a missing, truncated or incompatible net is an
-/// error here, and `--eval` defaults to classical so the net is never loaded
-/// unless it was asked for.
+/// error here. The embedded net is the default; `--eval classical` skips
+/// loading it.
 fn load_cli_nnue(mode: EvalMode, path: Option<&str>) -> anyhow::Result<Option<Arc<Network>>> {
     if mode != EvalMode::Nnue {
         return Ok(None);
@@ -384,7 +384,7 @@ fn cmd_bench(args: &[String], i: usize) -> anyhow::Result<()> {
     let mut stats = false;
     let mut params_path: Option<String> = None;
     let mut syzygy: Option<String> = None;
-    let mut eval = EvalMode::Classical;
+    let mut eval = EvalMode::Nnue;
     let mut net_path: Option<String> = None;
     while j < args.len() {
         let flag = args[j].clone();

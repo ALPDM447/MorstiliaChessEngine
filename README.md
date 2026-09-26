@@ -129,7 +129,7 @@ simply disables probing.
 ## Command line
 
 ```bash
-./target/release/morstilia --fen "<FEN>" --depth 12 --eval nnue   # one-shot search
+./target/release/morstilia --fen "<FEN>" --depth 12                # one-shot search
 ./target/release/morstilia --perft 5                               # perft from startpos
 ./target/release/morstilia --bench --depth 13                      # benchmark
 ./target/release/morstilia --evaluate "<FEN>"                      # classical eval breakdown
@@ -137,10 +137,10 @@ simply disables probing.
 ```
 
 Searches from the command line accept `--threads`, `--hash`, `--syzygy`,
-`--eval classical|nnue`, `--nnue <file>` and `--eval-params <file>`. They use
-the classical evaluation unless `--eval nnue` is given, so bench node counts
-stay comparable with earlier versions. With one thread the search is fully
-deterministic.
+`--eval classical|nnue`, `--nnue <file>` and `--eval-params <file>`. Like the
+UCI engine they use NNUE by default; pass `--eval classical` to compare bench
+node counts with versions before 7.0.0. With one thread the search is fully
+deterministic: `--bench --depth 13` searches 266,831 nodes.
 
 ## Tuning and matches
 

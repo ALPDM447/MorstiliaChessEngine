@@ -632,11 +632,19 @@ fn position(fen: &str) -> String {
 const NO_BOOK: &str = "setoption name BookEnabled value false";
 
 #[test]
-fn the_default_evaluator_is_classical_and_loads_no_net() {
-    // The engine must be usable with no net anywhere in sight, and must not
-    // spend time looking for one: nothing about the net appears on either
-    // stream.
+fn the_default_evaluator_is_nnue_and_classical_loads_no_net() {
     let (out, err, code) = run_capturing(&["--fen", KIWIPETE, "--depth", "6"]);
+    assert_eq!(code, Some(0), "stderr: {err}");
+    assert!(out.contains("bestmove "), "{out}");
+    assert!(
+        err.contains("nnue: loaded embedded default"),
+        "stderr: {err}"
+    );
+
+    // Classical must not spend time loading the net: nothing about it appears
+    // on either stream.
+    let (out, err, code) =
+        run_capturing(&["--fen", KIWIPETE, "--depth", "6", "--eval", "classical"]);
     assert_eq!(code, Some(0), "stderr: {err}");
     assert!(out.contains("bestmove "), "{out}");
     assert!(!err.contains("nnue"), "no net should be touched: {err}");
@@ -763,13 +771,13 @@ fn cli_rejects_an_unknown_evaluator() {
 fn bench_names_the_evaluator_it_ran() {
     // Bench figures are only comparable within one evaluator, and the two are
     // not on the same centipawn scale, so the header has to say which ran.
-    let (classical, _, code) = run_capturing(&["--bench", "--depth", "5"]);
+    let (classical, _, code) = run_capturing(&["--bench", "--depth", "5", "--eval", "classical"]);
     assert_eq!(code, Some(0));
     assert!(
         classical.lines().next().unwrap().contains("eval classical"),
         "{classical}"
     );
-    let (nnue, err, code) = run_capturing(&["--bench", "--depth", "5", "--eval", "nnue"]);
+    let (nnue, err, code) = run_capturing(&["--bench", "--depth", "5"]);
     assert_eq!(code, Some(0), "stderr: {err}");
     assert!(nnue.lines().next().unwrap().contains("eval nnue"), "{nnue}");
     // Same positions, same total-node line, genuinely different work.
