@@ -79,6 +79,14 @@ pub fn alphabeta(
         return qsearch::qsearch(pos, alpha, beta, ply, shared, thread, history);
     }
 
+    // Repetitions and dead positions are drawn before the TT is consulted:
+    // the table keys on the position alone, but a repetition depends on the
+    // path that reached it. The 50-move rule waits below, since checkmate on
+    // the hundredth half-move takes precedence.
+    if pos.halfmoves() < 100 && is_draw(pos, thread, history, ply) {
+        return 0;
+    }
+
     // Transposition-table probe.
     thread.stats.tt_probes += 1;
     let tt_entry = shared.tt.probe(pos.hash.into());
@@ -110,7 +118,7 @@ pub fn alphabeta(
         return if in_check { mated_in(ply as i32) } else { 0 };
     }
 
-    if is_draw(pos, thread, history, ply) {
+    if pos.halfmoves() >= 100 {
         return 0;
     }
 
@@ -574,6 +582,29 @@ mod tests {
             "d2d8",
             "the mating key must be Rd8+"
         );
+    }
+
+    #[test]
+    fn repetition_outranks_a_winning_tt_entry() {
+        // The TT says this position is won, but the game history has already
+        // seen it twice, so reaching it again is a threefold repetition.
+        let pos = Position::from_fen("6k1/8/8/8/8/8/5Q2/6K1 b - - 0 1").unwrap();
+        let shared = SearchShared {
+            tt: Arc::new(crate::tt::TranspositionTable::new(1)),
+            params: Arc::new(crate::evaluation::EvalParams::default()),
+            stop: Arc::new(AtomicBool::new(false)),
+            nodes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            node_cap: None,
+            tb: Arc::new(crate::endgame::Syzygy::none()),
+            nnue: None,
+        };
+        shared
+            .tt
+            .store(pos.hash.into(), RawMove::NULL, 500, 20, Bound::Exact);
+        let mut thread = SearchThread::new();
+        let history = [pos.hash, pos.hash];
+        let score = alphabeta(&pos, -1, 0, 4, 1, &shared, &mut thread, &history, true);
+        assert_eq!(score, 0, "a repeated position is a draw, not the TT score");
     }
 
     #[test]
