@@ -152,10 +152,9 @@ mod tests {
         // `min(file, 7 - file)` pairs a with h, b with g, c with f and d with e
         // — the mirror images that `OrientTBL` also applies to the pieces, so
         // the two half-tables cover the same 32 buckets each.
-        for s in 0..64 {
+        for (s, &bucket) in KING_BUCKETS.iter().enumerate() {
             let mirrored = (7 - (s & 7)) + 8 * (s >> 3);
-            assert_eq!(KING_BUCKETS[s], KING_BUCKETS[mirrored], "{s}");
-            let bucket = KING_BUCKETS[s];
+            assert_eq!(bucket, KING_BUCKETS[mirrored], "{s}");
             assert!(
                 (0..32).any(|k| k * 704 == bucket),
                 "{s} -> {bucket} is not one of the 32 buckets"
@@ -174,8 +173,8 @@ mod tests {
 
     #[test]
     fn orient_table_splits_the_board_down_the_centre() {
-        for s in 0..64 {
-            assert_eq!(ORIENT_TBL[s], if (s & 7) < 4 { 7 } else { 0 });
+        for (s, &orient) in ORIENT_TBL.iter().enumerate() {
+            assert_eq!(orient, if (s & 7) < 4 { 7 } else { 0 });
         }
     }
 

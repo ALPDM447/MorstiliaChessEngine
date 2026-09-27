@@ -111,18 +111,12 @@ pub fn evaluate_passed(
             if f < 7 {
                 let neighbour = passed_bb & Bitboard(file_mask(f + 1));
                 if !neighbour.is_empty() {
-                    let band = if color == Color::White {
-                        rank_mask(rank.saturating_sub(1))
-                            | rank_mask(rank)
-                            | if rank < 7 { rank_mask(rank + 1) } else { 0 }
-                    } else {
-                        rank_mask(rank.saturating_sub(1))
-                            | rank_mask(rank)
-                            | if rank < 7 { rank_mask(rank + 1) } else { 0 }
-                    };
                     // The rank band is already color-symmetric (ranks run the
                     // same upward for both sides in shakmaty); only the file
                     // direction needs care, which the `f < 7` guard handles.
+                    let band = rank_mask(rank.saturating_sub(1))
+                        | rank_mask(rank)
+                        | if rank < 7 { rank_mask(rank + 1) } else { 0 };
                     if !(neighbour & Bitboard(band)).is_empty() {
                         color_score += Score::new(p.connected_passed[0], p.connected_passed[1]);
                     }

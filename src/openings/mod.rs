@@ -502,8 +502,8 @@ mod tests {
         let c = suite.order(8);
         assert_ne!(a, c, "different seeds should (almost surely) differ");
         // Every suite index is used before any repeats when cycling.
-        for i in 0..suite.len() {
-            assert!(a[i] < suite.len());
+        for &i in &a {
+            assert!(i < suite.len());
         }
     }
 }

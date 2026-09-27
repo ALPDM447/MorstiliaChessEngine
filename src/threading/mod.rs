@@ -437,13 +437,11 @@ fn order_root_by_tb(
     if matches!(
         tb.probe_wdl(&root.chess),
         Some(TbOutcome::Win | TbOutcome::Loss)
-    ) {
-        if let Some((best, _)) = tb.root_best_move(&root.chess) {
-            if let Some(i) = ordered.iter().position(|&m| m == best) {
-                let mv = ordered.remove(i);
-                ordered.insert(0, mv);
-            }
-        }
+    ) && let Some((best, _)) = tb.root_best_move(&root.chess)
+        && let Some(i) = ordered.iter().position(|&m| m == best)
+    {
+        let mv = ordered.remove(i);
+        ordered.insert(0, mv);
     }
 
     let mut rebuilt = crate::types::MoveList::new();

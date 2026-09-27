@@ -32,11 +32,7 @@ pub fn iterative_search(
     limits: &TimeLimit,
     moves: &[RawMove],
 ) -> ThreadResult {
-    let max_depth = limits
-        .depth
-        .unwrap_or(MAX_DEPTH as i32)
-        .min(MAX_DEPTH as i32)
-        .max(0);
+    let max_depth = limits.depth.unwrap_or(MAX_DEPTH).clamp(0, MAX_DEPTH);
 
     thread.hashes[0] = root.hash;
     thread.ctx[0] = None;
@@ -165,12 +161,11 @@ pub fn iterative_search(
         depth_reached = depth;
 
         // Finish cleanly between iterations once the budget is spent.
-        if !limits.infinite {
-            if let Some(soft) = soft {
-                if Instant::now() >= soft {
-                    break;
-                }
-            }
+        if !limits.infinite
+            && let Some(soft) = soft
+            && Instant::now() >= soft
+        {
+            break;
         }
     }
 

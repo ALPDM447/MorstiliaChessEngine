@@ -902,8 +902,10 @@ impl PolyglotBook {
             );
         }
         let mut entries = Vec::with_capacity(bytes.len() / 16);
-        for chunk in bytes.chunks_exact(16) {
-            entries.push(BookEntry::from_bytes(chunk.try_into().unwrap()));
+        let (chunks, rest) = bytes.as_chunks::<16>();
+        debug_assert!(rest.is_empty(), "the size check above makes this exact");
+        for chunk in chunks {
+            entries.push(BookEntry::from_bytes(chunk));
         }
         entries.sort_unstable_by_key(|e| e.key);
         Ok(PolyglotBook { entries })
@@ -939,7 +941,7 @@ impl PolyglotBook {
             if !legal_in(pos, m) {
                 continue;
             }
-            if best.map_or(true, |(_, w)| e.weight > w) {
+            if best.is_none_or(|(_, w)| e.weight > w) {
                 best = Some((m, e.weight));
             }
         }
@@ -985,6 +987,11 @@ fn legal_in(pos: &Position, m: RawMove) -> bool {
 pub struct SplitMix64(pub u64);
 
 impl SplitMix64 {
+    // This is a SplitMix64 stream, not an `Iterator`: `next` is called at fixed
+    // points to replay a documented value sequence (see `matchplay`'s opening
+    // seeding), so the name is kept and only the trait-implementation
+    // suggestion is declined.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
         let mut z = self.0;

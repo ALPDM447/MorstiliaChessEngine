@@ -86,7 +86,7 @@ fn parse_position(mut tokens: core::str::SplitWhitespace<'_>) -> Command {
         Some("fen") => {
             let mut parts = Vec::new();
             // The FEN is exactly 6 fields; `moves` starts after them.
-            while let Some(t) = tokens.next() {
+            for t in tokens.by_ref() {
                 if t == "moves" {
                     break;
                 }
@@ -129,7 +129,7 @@ fn parse_go(tokens: core::str::SplitWhitespace<'_>) -> GoParams {
             "nodes" => g.nodes = it.next().and_then(|v| v.parse().ok()),
             "searchmoves" => {
                 // Collect until the next known keyword (or end).
-                while let Some(m) = it.next() {
+                for m in it.by_ref() {
                     if is_go_keyword(m) {
                         // un-consume is impossible; simplest is to re-walk.
                         // Rare path: rebuild from here would need lookahead —

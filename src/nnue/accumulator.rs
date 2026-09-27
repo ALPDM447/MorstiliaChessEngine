@@ -63,9 +63,7 @@ impl Accumulator {
         pp_3wide::append_active_indices(perspective, board, &mut other_active);
 
         let acc = &mut self.accumulation[p];
-        for j in 0..L1 {
-            acc[j] = ft.biases[j];
-        }
+        acc.copy_from_slice(&*ft.biases);
         for idx in psq_active.as_slice() {
             let row = ft.weight_row(*idx as usize);
             for j in 0..L1 {
@@ -82,9 +80,7 @@ impl Accumulator {
         }
 
         let pacc = &mut self.psqt[p];
-        for b in 0..PSQT_BUCKETS {
-            pacc[b] = 0;
-        }
+        pacc.fill(0);
         for idx in psq_active.as_slice() {
             let row = ft.psqt_weight_row(*idx as usize);
             for b in 0..PSQT_BUCKETS {
@@ -179,9 +175,7 @@ impl Accumulator {
         {
             let src = &parent.psqt[p];
             let dst = &mut self.psqt[p];
-            for b in 0..PSQT_BUCKETS {
-                dst[b] = src[b];
-            }
+            dst.copy_from_slice(src);
             for idx in psq_removed.as_slice() {
                 let row = ft.psqt_weight_row(*idx as usize);
                 for b in 0..PSQT_BUCKETS {

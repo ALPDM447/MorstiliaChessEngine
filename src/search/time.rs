@@ -136,7 +136,7 @@ fn clock_budget(go: &GoParams, pos: &Position) -> Option<u64> {
     }
 
     let moves = match go.movestogo {
-        Some(m) => m.max(1).min(MAX_PLANNED_MOVES),
+        Some(m) => m.clamp(1, MAX_PLANNED_MOVES),
         None => estimate_moves(pos.chess().fullmoves().get()),
     };
 

@@ -189,6 +189,10 @@ const fn init_index_lut2() -> [[[u8; 64]; 64]; PIECE_NB] {
     luts
 }
 
+// Built by a `const fn` so the const evaluator checks the rank arithmetic, and
+// kept `const` (not `static`) for the same reason as the sibling tables in
+// `attacks`: the const-context guarantee is part of what these tables are for.
+#[allow(clippy::large_const_arrays)]
 const INDEX_LUT2: [[[u8; 64]; 64]; PIECE_NB] = init_index_lut2();
 
 // --- index --------------------------------------------------------------------
@@ -382,9 +386,9 @@ mod tests {
 
     #[test]
     fn orient_table_is_the_mirror_image_of_half_ka() {
-        for s in 0..64 {
+        for (s, &orient) in ORIENT_TBL.iter().enumerate() {
             assert_ne!(
-                ORIENT_TBL[s],
+                orient,
                 half_ka_v2_hm::ORIENT_TBL[s],
                 "square {s} should mirror the other way"
             );

@@ -506,10 +506,10 @@ fn parse_pgn_game(block: &str) -> anyhow::Result<PgnGame> {
         if parse_result(raw).is_some() {
             continue;
         }
-        if let Some(nag) = raw.strip_prefix('$') {
-            if nag.chars().all(|c| c.is_ascii_digit()) {
-                continue; // NAG annotation
-            }
+        if let Some(nag) = raw.strip_prefix('$')
+            && nag.chars().all(|c| c.is_ascii_digit())
+        {
+            continue; // NAG annotation
         }
         let tok = raw.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
         if tok.is_empty() || tok == "--" {

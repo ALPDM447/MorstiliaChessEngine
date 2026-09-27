@@ -4,18 +4,22 @@
 //!
 //! 1. node bookkeeping (count, stop) and search-ply guards,
 //! 2. mate-distance pruning,
-//! 3. terminal/draw detection,
-//! 4. transposition-table probe (with mate-score re-basing),
-//! 5. node-level pruning: reverse futility, razoring, null-move probing and
+//! 3. terminal detection: the 50-move rule (above the table, because the table
+//!    does not key on the halfmove clock) and checkmate at the MAX_PLY limit,
+//! 4. the depth-0 horizon, then repetition / dead positions,
+//! 5. transposition-table probe (with mate-score re-basing),
+//! 6. mate/stalemate detection, static evaluation and `improving`,
+//! 7. node-level pruning: reverse futility, razoring, null-move probing and
 //!    ProbCut (guarded against check, PV nodes, mate bounds and pawn-only
 //!    zugzwang positions),
-//! 6. move generation, ordering (TT move, MVV-LVA, killers, history),
-//! 7. the principal-variation loop: futility pruning, SEE pruning,
+//! 8. move generation, ordering (TT move, MVV-LVA, killers, history),
+//! 9. the principal-variation loop: futility pruning, SEE pruning,
 //!    history pruning, late-move reductions (depth/move-number/history
 //!    driven, with full-depth re-search on fail-high), PVS zero-window
-//!    re-searches,
-//! 8. history/killer updates on quiet beta cutoffs,
-//! 9. TT store (skipped once the search is aborted).
+//!    re-searches, and a last-resort unpruned search so that a node with legal
+//!    moves never ends up with no score at all,
+//! 10. history/killer updates on quiet beta cutoffs,
+//! 11. TT store (skipped once the search is aborted).
 //!
 //! The board is never mutated: every child is a fresh `Position` clone
 //! ([`crate::board::Position::make_child`]), so push/pop bugs are impossible
@@ -42,6 +46,10 @@ use crate::types::{Depth, INFINITE, MAX_MOVES, MAX_PLY, RawMove, mate_in, mated_
 /// carries the pre-root position hashes for repetition detection; `allow_null`
 /// permits a null-move probe at this node (false directly under a null move,
 /// so two passes can never be played in a row).
+// The nine parameters are the search interface itself: bundling them would only
+// forward them again, and `alphabeta` is the one place the whole search state
+// is legitimately visible at once.
+#[allow(clippy::too_many_arguments)]
 pub fn alphabeta(
     pos: &Position,
     mut alpha: i32,
@@ -72,7 +80,31 @@ pub fn alphabeta(
         return alpha;
     }
 
+    // The 50-move rule is forced by the position alone, and the transposition
+    // table does **not** key on the halfmove clock: the very same board with
+    // clock 40 may hold a stored score, and returning it for a clock-200
+    // position would report a decided game as still running. So the rule is
+    // settled here, above the probe, and it also covers the depth-0 horizon
+    // below (quiescence has no counter of its own). Checkmate is the one
+    // outcome that outranks it, so a mated side to move is recognised first —
+    // and only then, on the (practically unreachable) clock-200 path, does the
+    // legal-move list get built.
+    if pos.halfmoves() >= 100 {
+        if in_check && pos.legal_moves().is_empty() {
+            return mated_in(ply as i32);
+        }
+        return 0;
+    }
+
+    // The MAX_PLY guard is a safety limit, not a horizon: the move loop below
+    // cannot be entered any more, but a checkmate is a checkmate at every
+    // depth and must not be reported as an ordinary, if very bad, position.
+    // Only the deepest ply a search can reach pays for the legal-move list, and
+    // only when the side to move is actually in check.
     if ply >= MAX_PLY - 1 {
+        if in_check && pos.legal_moves().is_empty() {
+            return mated_in(ply as i32);
+        }
         return thread.evaluate_at(pos, shared, ply);
     }
     if depth <= 0 {
@@ -81,9 +113,8 @@ pub fn alphabeta(
 
     // Repetitions and dead positions are drawn before the TT is consulted:
     // the table keys on the position alone, but a repetition depends on the
-    // path that reached it. The 50-move rule waits below, since checkmate on
-    // the hundredth half-move takes precedence.
-    if pos.halfmoves() < 100 && is_draw(pos, thread, history, ply) {
+    // path that reached it.
+    if is_draw(pos, thread, history, ply) {
         return 0;
     }
 
@@ -116,10 +147,6 @@ pub fn alphabeta(
     let mut moves = pos.legal_moves();
     if moves.is_empty() {
         return if in_check { mated_in(ply as i32) } else { 0 };
-    }
-
-    if pos.halfmoves() >= 100 {
-        return 0;
     }
 
     let static_eval = thread.evaluate_at(pos, shared, ply);
@@ -172,31 +199,30 @@ pub fn alphabeta(
         && depth >= pruning::NULL_MOVE_MIN_DEPTH
         && static_eval >= beta
         && pruning::side_has_attacking_pieces(pos.board(), pos.turn())
+        && pos.null_move().is_some()
     {
-        if pos.null_move().is_some() {
-            thread.stats.null_probes += 1;
-            thread.ctx[ply + 1] = None;
-            // Passing changes nothing on the board, so the child's accumulator
-            // is the parent's — a copy, not a refresh.
-            let nulled = thread.make_child_null(pos, shared, ply + 1);
-            let null_score = -alphabeta(
-                &nulled,
-                -beta,
-                -beta + 1,
-                depth - 1 - pruning::null_move_reduction(depth, improving),
-                ply + 1,
-                shared,
-                thread,
-                history,
-                false,
-            );
-            if thread.stopped {
-                return 0;
-            }
-            if null_score >= beta {
-                thread.stats.null_cutoffs += 1;
-                return null_score;
-            }
+        thread.stats.null_probes += 1;
+        thread.ctx[ply + 1] = None;
+        // Passing changes nothing on the board, so the child's accumulator
+        // is the parent's — a copy, not a refresh.
+        let nulled = thread.make_child_null(pos, shared, ply + 1);
+        let null_score = -alphabeta(
+            &nulled,
+            -beta,
+            -beta + 1,
+            depth - 1 - pruning::null_move_reduction(depth, improving),
+            ply + 1,
+            shared,
+            thread,
+            history,
+            false,
+        );
+        if thread.stopped {
+            return 0;
+        }
+        if null_score >= beta {
+            thread.stats.null_cutoffs += 1;
+            return null_score;
         }
     }
 
@@ -271,6 +297,18 @@ pub fn alphabeta(
         let m = moves.get(i);
         let is_tactical = is_capture_or_promotion(pos.board(), m);
 
+        // Safety net for the (theoretically reachable) node where futility, SEE
+        // and history pruning together reject *every* legal move. Such a node
+        // would fall out of the loop with `best == -INFINITE` and no best move,
+        // and the TT store below would then persist a bound on nothing — a
+        // meaningless score that later searches could cut on. So the last
+        // resort is: while nothing has been searched yet, this move is
+        // searched with every move-level prune switched off. Once one move has
+        // been searched the flag drops again, so a healthy node grows by
+        // nothing. LMR needs no counterpart here — it already requires at
+        // least two searched moves before it applies.
+        let forced = searched == 0;
+
         // --- Pruning (only below the root of the local window) ---
         // None of these skips a checking move: a quiet check or a checking
         // sacrifice can start a forced line the static view cannot see. The
@@ -283,6 +321,7 @@ pub fn alphabeta(
         if !pv_node
             && !in_check
             && !is_tactical
+            && !forced
             && depth <= pruning::FUTILITY_DEPTH
             && searched > 0
             && static_eval + pruning::futility_margin(depth, improving) <= alpha
@@ -293,7 +332,7 @@ pub fn alphabeta(
         }
 
         // SEE pruning: hopeless captures are skipped outright.
-        if !pv_node && !in_check && is_tactical {
+        if !pv_node && !in_check && is_tactical && !forced {
             thread.stats.see_calls += 1;
             let see_v = see::see(pos.board(), m, &shared.params);
             if see_v < pruning::see_prune_threshold(depth) && !gives_check() {
@@ -306,6 +345,7 @@ pub fn alphabeta(
         if !pv_node
             && !in_check
             && !is_tactical
+            && !forced
             && depth <= 6
             && searched >= pruning::QUIET_PRUNE_LIMIT
             && thread.tables.history.history_score(pos.turn(), m) < pruning::HISTORY_PRUNE_THRESHOLD
@@ -326,28 +366,25 @@ pub fn alphabeta(
 
         // --- Late move reductions (quiet, late, non-checking moves) ---
         // The reduction is a pure function of depth, move number (how late in
-        // the ordering), node type, "improving" status, check status and the
-        // move's learned history — a move that has proven good is searched
-        // deeper, one that keeps failing is cut more. Only the first move (or
-        // the first two at PV nodes) is never reduced, so the PV cannot be
-        // lost to an over-reduction.
+        // the ordering), node type, "improving" status and the move's learned
+        // history — a move that has proven good is searched deeper, one that
+        // keeps failing is cut more. `reductions::allows_lmr` holds every
+        // exclusion, including the one that matters most here: **the side to
+        // move being in check**. Only the first move (or the first two at PV
+        // nodes) is never reduced, so the PV cannot be lost to an
+        // over-reduction.
         let mut new_depth = child_depth;
         let mut reduced = false;
-        if child_depth == depth - 1
-            && !is_tactical
-            && depth >= 3
-            && searched >= 2 + usize::from(pv_node)
-            && !(in_check && searched < 4)
-        {
+        if reductions::allows_lmr(
+            child_depth,
+            depth,
+            is_tactical,
+            in_check,
+            searched + 1,
+            pv_node,
+        ) {
             let history = thread.tables.history.history_score(pos.turn(), m);
-            let r = reductions::lmr_reduction(
-                depth,
-                searched + 1,
-                pv_node,
-                improving,
-                in_check,
-                history,
-            );
+            let r = reductions::lmr_reduction(depth, searched + 1, pv_node, improving, history);
             if r > 0 {
                 let d = (child_depth - r).max(1);
                 reduced = d < child_depth;
@@ -491,6 +528,19 @@ pub fn alphabeta(
         } else {
             Bound::Upper
         };
+        // `moves` was non-empty here, so the move-level fallback above
+        // guarantees at least one was searched: `best_move` is a real legal
+        // move and `best` a real score. The debug assertion documents the
+        // invariant without adding a branch to the hot path.
+        debug_assert_ne!(
+            best_move,
+            RawMove::NULL,
+            "a node with legal moves must search one"
+        );
+        debug_assert!(
+            best > -INFINITE,
+            "an unsearched node must not be scored as -INFINITE"
+        );
         shared.tt.store(
             pos.hash.into(),
             best_move,
@@ -545,8 +595,18 @@ mod tests {
 
     /// Runs a single fixed-depth search from a FEN.
     fn search_depth(fen: &str, depth: Depth) -> crate::search::SearchResult {
+        search_depth_threads(fen, depth, 4)
+    }
+
+    /// Like `search_depth` but with an explicit thread count, so a test that
+    /// asserts an exact score can pin the single-threaded search.
+    fn search_depth_threads(
+        fen: &str,
+        depth: Depth,
+        threads: usize,
+    ) -> crate::search::SearchResult {
         let pos = Position::from_fen(fen).unwrap();
-        let mut searcher = crate::search::Searcher::new(4);
+        let mut searcher = crate::search::Searcher::new(threads);
         let stop = AtomicBool::new(false);
         let limits = crate::search::TimeLimit {
             depth: Some(depth),
@@ -557,6 +617,20 @@ mod tests {
             infinite: true,
         };
         searcher.search(&pos, &[], &limits, &Arc::new(stop), 1, &[])
+    }
+
+    /// A bare `SearchShared` for calling `alphabeta` directly: a 1 MiB table,
+    /// default eval, no node cap, no tablebase and no NNUE.
+    fn direct_shared() -> SearchShared {
+        SearchShared {
+            tt: Arc::new(crate::tt::TranspositionTable::new(1)),
+            params: Arc::new(crate::evaluation::EvalParams::default()),
+            stop: Arc::new(AtomicBool::new(false)),
+            nodes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            node_cap: None,
+            tb: Arc::new(crate::endgame::Syzygy::none()),
+            nnue: None,
+        }
     }
 
     #[test]
@@ -605,6 +679,240 @@ mod tests {
         let history = [pos.hash, pos.hash];
         let score = alphabeta(&pos, -1, 0, 4, 1, &shared, &mut thread, &history, true);
         assert_eq!(score, 0, "a repeated position is a draw, not the TT score");
+    }
+
+    /// Rd8 is mate (f8/h8 stay on the rook's rank, f7/g7/h7 are black's own
+    /// pawns), so this is a real checkmate with the halfmove clock already at
+    /// 100 — the board a 50-move draw would otherwise claim.
+    const MATED_AT_CLOCK_100: &str = "3R2k1/5ppp/8/8/8/8/8/6K1 b - - 100 60";
+
+    #[test]
+    fn checkmate_outranks_the_fifty_move_rule() {
+        // Checkmate is the one result that outranks the 50-move rule, so the
+        // rule must never be settled before the mated side is recognised.
+        let pos = Position::from_fen(MATED_AT_CLOCK_100).unwrap();
+        assert_eq!(pos.halfmoves(), 100, "the fixture needs a full clock");
+        assert!(pos.is_check(), "black must be in check");
+        assert!(pos.legal_moves().is_empty(), "and mated");
+
+        let shared = direct_shared();
+        let mut thread = SearchThread::new();
+        let score = alphabeta(
+            &pos,
+            -INFINITE,
+            INFINITE,
+            1,
+            0,
+            &shared,
+            &mut thread,
+            &[],
+            true,
+        );
+        assert_eq!(
+            score,
+            mated_in(0),
+            "a mate at clock 100 is a mate, not a draw: got {score}"
+        );
+    }
+
+    #[test]
+    fn fifty_move_draw_outranks_a_winning_tt_entry() {
+        // The transposition table keys on the board alone, with no halfmove
+        // clock in the key, so the same board at clock 40 shares this entry.
+        // A clock-100 position is drawn by the 50-move rule and the rule has
+        // to be settled *before* the probe, or the stored win is reported.
+        let pos = Position::from_fen("6k1/8/8/8/8/8/5Q2/6K1 b - - 100 60").unwrap();
+        assert_eq!(pos.halfmoves(), 100, "the fixture needs a full clock");
+        let shared = direct_shared();
+        shared
+            .tt
+            .store(pos.hash.into(), RawMove::NULL, 500, 20, Bound::Exact);
+        let mut thread = SearchThread::new();
+        // A null window, so the probe is allowed to cut (`!pv_node`).
+        let score = alphabeta(&pos, 0, 1, 4, 0, &shared, &mut thread, &[], true);
+        assert_eq!(score, 0, "the 50-move rule outranks the table: got {score}");
+    }
+
+    #[test]
+    fn fifty_move_draw_also_covers_the_depth_zero_horizon() {
+        // Quiescence keeps no halfmove counter of its own, so the rule cannot
+        // be left to the depth-0 branch either: a depth-0 search of a
+        // clock-100 position must be a draw, not a stand-pat score.
+        let pos = Position::from_fen("6k1/8/8/8/8/8/5Q2/6K1 b - - 100 60").unwrap();
+        let shared = direct_shared();
+        let mut thread = SearchThread::new();
+        let score = alphabeta(
+            &pos,
+            -INFINITE,
+            INFINITE,
+            0,
+            0,
+            &shared,
+            &mut thread,
+            &[],
+            true,
+        );
+        assert_eq!(score, 0, "clock 100 is a draw even at the horizon");
+    }
+
+    #[test]
+    fn checkmate_at_max_ply_is_reported_as_a_mate() {
+        // The MAX_PLY guard stops the move loop from being entered, but it is
+        // a safety limit, not a horizon: a checkmate is a checkmate at every
+        // ply and must not be reported as a (very bad) static evaluation.
+        let pos = Position::from_fen("3R2k1/5ppp/8/8/8/8/8/6K1 b - - 0 60").unwrap();
+        assert!(pos.is_check() && pos.legal_moves().is_empty());
+        let shared = direct_shared();
+        let mut thread = SearchThread::new();
+        let ply = MAX_PLY - 1;
+        let score = alphabeta(
+            &pos,
+            -INFINITE,
+            INFINITE,
+            1,
+            ply,
+            &shared,
+            &mut thread,
+            &[],
+            true,
+        );
+        assert_eq!(
+            score,
+            mated_in(ply as i32),
+            "the mate score must survive the MAX_PLY guard: got {score}"
+        );
+    }
+
+    #[test]
+    fn no_evasion_in_a_check_node_is_reduced() {
+        // Black is in check with six legal evasions. None is a capture and none
+        // gives check, so with a fresh table (no TT move, no killers) the only
+        // thing that could keep the late ones at full depth is the in-check
+        // gate itself. Each evasion is replayed through the exact predicate
+        // `alphabeta` uses for it, at the root's depth on a PV node.
+        let fen = "8/4R3/8/8/4k3/8/8/K7 b - - 0 1";
+        let pos = Position::from_fen(fen).unwrap();
+        assert!(pos.is_check(), "the fixture needs a check");
+        let moves = pos.legal_moves();
+        assert_eq!(moves.len(), 6, "the fixture needs six evasions");
+
+        const DEPTH: Depth = 6;
+        let (child_depth, pv_node) = (DEPTH - 1, true);
+        let mut reducible_late = 0;
+        for (i, m) in moves.iter().enumerate() {
+            let moved = i + 1;
+            assert!(
+                !is_capture_or_promotion(pos.board(), m),
+                "{} must be quiet",
+                m.to_uci()
+            );
+            assert!(
+                !pos.make_child(m).is_check(),
+                "{} must not give check",
+                m.to_uci()
+            );
+            assert!(
+                !reductions::allows_lmr(child_depth, DEPTH, false, true, moved, pv_node),
+                "evasion {moved} ({}) must be searched at full depth",
+                m.to_uci()
+            );
+            if moved >= 4 {
+                reducible_late += 1;
+                assert!(
+                    reductions::allows_lmr(child_depth, DEPTH, false, false, moved, pv_node),
+                    "evasion {moved} would not be reducible at all — \
+                     this fixture would not be testing the in-check gate"
+                );
+            }
+        }
+        assert_eq!(reducible_late, 3, "three evasions must be late enough");
+
+        // And the search itself must come back with a real evasion.
+        let r = search_depth(fen, DEPTH);
+        assert!(r.best != RawMove::NULL, "must find an evasion");
+        assert!(pos.raw_move_legal(r.best), "the evasion must be legal");
+        assert!(
+            r.score > -INFINITE && r.score < INFINITE,
+            "a finite score: got {}",
+            r.score
+        );
+    }
+
+    /// The Fix 4 fixture: White's king on a1 is boxed in (a2 is a defended
+    /// pawn, b1 and b2 are covered by Nc3/Nc4) and the knight on b1 has exactly
+    /// three moves, all of them captures of defended pawns. Every one of them
+    /// loses the exchange (`-220` against a depth-1 SEE threshold of `-80`),
+    /// so a non-PV cut node prunes all three and would leave no move at all.
+    const ALL_MOVES_PRUNED: &str = "k5r1/8/8/8/1p3b2/p1p5/3pn3/1N5K w - - 0 1";
+
+    #[test]
+    fn a_node_whose_moves_are_all_pruned_still_searches_one() {
+        let pos = Position::from_fen(ALL_MOVES_PRUNED).unwrap();
+        let moves = pos.legal_moves();
+        assert_eq!(moves.len(), 3, "only the knight can move");
+        for m in moves.iter() {
+            assert!(is_capture_or_promotion(pos.board(), m));
+            assert!(
+                see::see(pos.board(), m, &shared_params()) < pruning::see_prune_threshold(1),
+                "{} must be SEE-pruned at depth 1",
+                m.to_uci()
+            );
+        }
+
+        // The window is chosen so neither razoring (it would answer before the
+        // move loop) nor a null move can short-circuit this node: a window
+        // zero-width at the very bottom of the static eval.
+        let shared = direct_shared();
+        let mut thread = SearchThread::new();
+        let score = alphabeta(&pos, -2900, -2899, 1, 0, &shared, &mut thread, &[], true);
+        assert!(
+            score > -INFINITE,
+            "a real score, not -INFINITE: got {score}"
+        );
+
+        let entry = shared
+            .tt
+            .probe(pos.hash.into())
+            .expect("the node must store an entry");
+        assert_ne!(
+            entry.mv,
+            RawMove::NULL,
+            "a node with legal moves must search one"
+        );
+        assert!(entry.score > -INFINITE, "no -INFINITE may reach the table");
+        assert!(
+            pos.raw_move_from_uci(entry.mv.to_uci().as_str()).is_some(),
+            "the stored move must be legal, got {}",
+            entry.mv.to_uci()
+        );
+    }
+
+    #[test]
+    fn the_forced_move_is_searched_and_the_rest_stay_pruned() {
+        // One ply deeper the fallback is not the whole story: the forced move
+        // is searched unpruned and the two hopeless captures *are* still
+        // pruned, so the fallback costs one move, not the node.
+        let pos = Position::from_fen(ALL_MOVES_PRUNED).unwrap();
+        let shared = direct_shared();
+        let mut thread = SearchThread::new();
+        let score = alphabeta(&pos, -2850, -2849, 2, 0, &shared, &mut thread, &[], true);
+        assert!(
+            score > -INFINITE,
+            "a real score, not -INFINITE: got {score}"
+        );
+        assert_eq!(
+            thread.stats.see_pruned, 2,
+            "only the two remaining hopeless captures may be pruned"
+        );
+        let entry = shared
+            .tt
+            .probe(pos.hash.into())
+            .expect("the node must store an entry");
+        assert_ne!(entry.mv, RawMove::NULL);
+    }
+
+    fn shared_params() -> crate::evaluation::EvalParams {
+        crate::evaluation::EvalParams::default()
     }
 
     #[test]
@@ -905,6 +1213,37 @@ mod tests {
             r.stats.lmr_reduced
         );
         assert!(r.stats.lmr_researched <= r.stats.lmr_reduced);
+    }
+
+    #[test]
+    fn lmr_never_runs_in_a_check_node() {
+        // Black is in check on f7 with five evasions and is mated in four. A
+        // check node is a forced node: every evasion has to be refuted, so
+        // reducing a late one is the worst possible place to save a ply — and
+        // it costs this mate a whole iteration. With LMR applied in check the
+        // mate is first seen at depth 9; with the in-check gate it appears at
+        // depth 8.
+        let fen = "8/5k2/8/3Q3K/8/8/8/8 b - - 8 33";
+        let pos = Position::from_fen(fen).unwrap();
+        assert!(pos.is_check(), "the fixture needs a check");
+        assert_eq!(
+            pos.legal_moves().len(),
+            5,
+            "the fixture needs five evasions"
+        );
+        // Pinned to one thread: the Lazy-SMP helper pool can find the mate a
+        // ply early out of a shared table, which would hide the difference.
+        let r = search_depth_threads(fen, 8, 1);
+        assert!(
+            crate::types::is_mate(r.score),
+            "the forced mate must survive at depth 8: got {} ({})",
+            r.score,
+            r.best.to_uci()
+        );
+        assert!(
+            r.stats.lmr_reduced > 0,
+            "reductions must still run — just not in check nodes"
+        );
     }
 
     #[test]

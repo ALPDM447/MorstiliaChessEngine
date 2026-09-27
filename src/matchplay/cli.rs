@@ -272,10 +272,10 @@ fn run(args: &[String]) -> anyhow::Result<()> {
         Some(t) => t,
         None => TimeControl::Depth(depth_opt.unwrap_or(6)),
     };
-    if let TimeControl::Depth(d) = tc {
-        if d < 1 {
-            bail!("--depth must be >= 1");
-        }
+    if let TimeControl::Depth(d) = tc
+        && d < 1
+    {
+        bail!("--depth must be >= 1");
     }
     if max_plies < 1 {
         bail!("--max-plies must be >= 1");
@@ -457,16 +457,14 @@ fn run(args: &[String]) -> anyhow::Result<()> {
     // Tune linking (informational, matches the Stage-5 workflow): only in the
     // classic fixed-depth, fixed-color mode where white-relative records and a
     // single opening stream have their original meaning.
-    if !alternate {
-        if let TimeControl::Depth(d) = tc {
-            let records = std_games_to_records(&report);
-            let ds = crate::tuning::dataset::DataSet::from_selfplay_games(&records).with_seed(seed);
-            eprintln!(
-                "dataset: {} entries from {} games (seed {seed}, depth {d}) -> pipe into tune",
-                ds.len(),
-                records.len()
-            );
-        }
+    if !alternate && let TimeControl::Depth(d) = tc {
+        let records = std_games_to_records(&report);
+        let ds = crate::tuning::dataset::DataSet::from_selfplay_games(&records).with_seed(seed);
+        eprintln!(
+            "dataset: {} entries from {} games (seed {seed}, depth {d}) -> pipe into tune",
+            ds.len(),
+            records.len()
+        );
     }
     Ok(())
 }
@@ -491,6 +489,9 @@ fn parse_tc(s: &str) -> anyhow::Result<TimeControl> {
             .trim_start_matches(['=', ' ', '\t'])
             .parse()
             .with_context(|| format!("bad movetime control {s:?}"))?;
+        // `!(x > 0.0)` and not `x <= 0.0`: the negated form is also true for
+        // NaN, so `--movetime nan` is rejected rather than silently accepted.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
         if !(sec > 0.0) {
             bail!("movetime must be positive");
         }
@@ -515,6 +516,8 @@ fn parse_tc(s: &str) -> anyhow::Result<TimeControl> {
         .trim()
         .parse()
         .with_context(|| format!("bad increment in {s:?}"))?;
+    // As above: `!(base_sec > 0.0)` rejects NaN, `base_sec <= 0.0` would not.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if moves == 0 || !(base_sec > 0.0) || inc_sec < 0.0 {
         bail!("bad time control {s:?}");
     }

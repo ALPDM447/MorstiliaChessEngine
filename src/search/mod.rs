@@ -323,18 +323,18 @@ impl SearchThread {
             self.stopped = true;
             return;
         }
-        if let Some(cap) = shared.node_cap {
-            if shared.nodes.load(Ordering::Relaxed) >= cap {
-                self.stopped = true;
-                shared.stop.store(true, Ordering::Relaxed);
-                return;
-            }
+        if let Some(cap) = shared.node_cap
+            && shared.nodes.load(Ordering::Relaxed) >= cap
+        {
+            self.stopped = true;
+            shared.stop.store(true, Ordering::Relaxed);
+            return;
         }
-        if let Some(deadline) = self.deadline {
-            if Instant::now() >= deadline {
-                self.stopped = true;
-                shared.stop.store(true, Ordering::Relaxed);
-            }
+        if let Some(deadline) = self.deadline
+            && Instant::now() >= deadline
+        {
+            self.stopped = true;
+            shared.stop.store(true, Ordering::Relaxed);
         }
     }
 
@@ -831,9 +831,9 @@ mod tests {
             "r1bq1rk1/ppp2ppp/2np1n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQR1K1 w - - 0 8",
         )
         .unwrap();
-        for i in 0..6 {
+        for i in 0..6i32 {
             let lim = TimeLimit {
-                depth: Some(3 + (i as i32) % 2),
+                depth: Some(3 + i % 2),
                 nodes: None,
                 movetime_ms: None,
                 soft_ms: 0,
@@ -841,7 +841,7 @@ mod tests {
                 infinite: true,
             };
             let res = searcher.search(&pos, &[], &lim, &stop, 4, &[]);
-            assert_eq!(res.depth, 3 + (i as i32) % 2);
+            assert_eq!(res.depth, 3 + i % 2);
             assert!(!res.is_none());
         }
         // No helper left behind after searches (pool is persistent and exact).

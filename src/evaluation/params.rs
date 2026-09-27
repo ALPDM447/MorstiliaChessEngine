@@ -538,15 +538,12 @@ impl EvalParams {
         // PST (role 1..=6, phase 0..=1, square 0..=63).
         let role_names = ["", "pawn", "knight", "bishop", "rook", "queen", "king"];
         let phase_names = ["mg", "eg"];
-        for role in 1..=6usize {
-            for phase in 0..=1usize {
+        for (role, role_name) in role_names.iter().enumerate().skip(1) {
+            for phase_name in &phase_names {
                 for sq in 0..64usize {
                     let (min, max) = pst_bounds(role);
                     out.push(ParamDef {
-                        name: concat_names(&format!(
-                            "pst.{}.{}.{}",
-                            role_names[role], phase_names[phase], sq
-                        )),
+                        name: concat_names(&format!("pst.{role_name}.{phase_name}.{sq}")),
                         min,
                         max,
                     });
@@ -782,8 +779,8 @@ impl EvalParams {
 
 /// Leaks a `String` into a `'static str` for `ParamDef` names (the tuner only
 /// ever reads them; the count of leaked strings is bounded and tiny).
-fn concat_names(s: &String) -> &'static str {
-    Box::leak(s.clone().into_boxed_str())
+fn concat_names(s: &str) -> &'static str {
+    Box::leak(s.to_owned().into_boxed_str())
 }
 
 /// PST bounds: material-sized swings for majors, smaller for pawns/kings.

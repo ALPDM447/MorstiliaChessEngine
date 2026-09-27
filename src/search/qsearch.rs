@@ -12,6 +12,12 @@
 //! * **SEE pruning** skips captures that lose material outright (negative
 //!   static exchange) when not in check.
 //!
+//! Neither prune ever skips a capture that *gives check*: the node it leads to
+//! is a node where the opponent is in check and quiescence is already at full
+//! width, so the check is a tactical resource the static estimates above cannot
+//! price. (Quiet checks are still never generated here — that would be a
+//! horizon change, not a safety fix.)
+//!
 //! Quiescence never writes the transposition table.
 
 use shakmaty::Role;
@@ -133,16 +139,32 @@ pub fn qsearch(
         }
         let m = moves.get(i);
 
+        // A capture that gives check is not an ordinary capture: the node it
+        // leads to has the *opponent* to move in check, where quiescence itself
+        // is at full width, so it can resolve a line no static exchange
+        // evaluation can see (a fork behind the capture, a discovered attack
+        // the "defender" cannot answer). Both prunes below therefore skip it,
+        // exactly as the main search's move loop already does. The test plays
+        // the move on a scratch copy, so it only runs once a prune condition
+        // has already fired.
+        let mut gives_check = None;
+        let mut gives_check = || *gives_check.get_or_insert_with(|| pos.make_child(m).is_check());
+
         // Delta pruning: the capture cannot possibly reach near alpha.
-        if !in_check && best + touched_value(pos, m, &shared.params) + DELTA_MARGIN <= alpha {
+        if !in_check
+            && best + touched_value(pos, m, &shared.params) + DELTA_MARGIN <= alpha
+            && !gives_check()
+        {
             thread.stats.delta_pruned += 1;
             continue;
         }
         // SEE pruning: a capture that loses material is a horizon blunder,
-        // not a way out of the quiet-move tail.
+        // not a way out of the quiet-move tail. SEE is consulted first because
+        // it is far cheaper than building the child position.
         if !in_check {
             thread.stats.see_calls += 1;
-            if crate::move_ordering::see::see(pos.board(), m, &shared.params) < 0 {
+            if crate::move_ordering::see::see(pos.board(), m, &shared.params) < 0 && !gives_check()
+            {
                 thread.stats.see_pruned += 1;
                 continue;
             }
@@ -288,6 +310,156 @@ mod tests {
             Evaluator.evaluate(&Position::from_fen("4k3/8/8/8/3P4/8/8/4K1b1 b - - 0 1").unwrap());
         assert_eq!(delta_pruned, 1, "the only capture must be delta-pruned");
         assert_eq!(v, stand_pat, "stand pat: the capture was skipped");
+    }
+
+    // --- Captures that give check -------------------------------------------
+
+    /// Runs qsearch with the given window, returning the score together with
+    /// the two prune counters the checking-capture rule is about:
+    /// `(score, delta_pruned, see_calls, see_pruned)`.
+    fn q_prunes(fen: &str, alpha: i32, beta: i32) -> (i32, u64, u64, u64) {
+        let pos = Position::from_fen(fen).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let empty_tt = Arc::new(crate::tt::TranspositionTable::new(1));
+        let default_params = Arc::new(crate::evaluation::EvalParams::default());
+        let shared = SearchShared {
+            tt: empty_tt,
+            params: default_params,
+            stop,
+            nodes: Arc::new(AtomicU64::new(0)),
+            node_cap: None,
+            tb: Arc::new(crate::endgame::Syzygy::none()),
+            nnue: None,
+        };
+        let mut thread = SearchThread::new();
+        let v = qsearch(&pos, alpha, beta, 0, &shared, &mut thread, &[]);
+        (
+            v,
+            thread.stats.delta_pruned,
+            thread.stats.see_calls,
+            thread.stats.see_pruned,
+        )
+    }
+
+    #[test]
+    fn a_checking_capture_survives_delta_pruning() {
+        // White's stand pat is -241, and both available captures are worth
+        // 100, so `best + 100 + 200 = 59` cannot reach a window demanding 400:
+        // the delta margin rules out *both* captures on material alone. One of
+        // them, Nxc6+, is not an ordinary capture — it forks the king on e7 and
+        // the rook on a5, and the node it leads to has black in check, at full
+        // width, where seven replies are resolved — so it must be searched.
+        let fen = "8/4k3/2p5/rP6/1N6/8/6K1/8 w - - 0 1";
+        let pos = Position::from_fen(fen).unwrap();
+        let m = pos.raw_move_from_uci("b4c6").unwrap();
+        assert!(pos.raw_move_legal(m));
+        assert!(pos.make_child(m).is_check(), "Nxc6+ must give check");
+        let stand_pat = Evaluator.evaluate(&pos);
+
+        let (v, delta_pruned, see_calls, see_pruned) = q_prunes(fen, 400, 32_001);
+        assert_eq!(
+            delta_pruned, 1,
+            "only the quiet bxc6 may be delta-pruned; Nxc6+ gives check"
+        );
+        assert_eq!(see_pruned, 0, "no capture is SEE-pruned here");
+        assert!(see_calls >= 1, "the SEE test must still be consulted");
+        assert!(
+            v > stand_pat + 400,
+            "the fork must be found: stand pat {stand_pat}, qsearch {v}"
+        );
+    }
+
+    #[test]
+    fn a_checking_capture_survives_see_pruning() {
+        // Rxb8+ looks like rook-for-knight: the bishop on e5 does guard b8, so
+        // SEE is -180 and the exchange is "lost". It cannot actually recapture
+        // — it is pinned against the king on e8 by the rook on e1, so b8 is
+        // free and the check is resolved in white's favour. Pruning the move
+        // because of a material-only static exchange throws away 600-odd
+        // centipawns, so a capture that gives check skips the SEE test.
+        let fen = "1n2k3/8/8/1R2b3/8/8/8/4R1K1 w - - 0 1";
+        let pos = Position::from_fen(fen).unwrap();
+        let params = crate::evaluation::EvalParams::default();
+        let m = pos.raw_move_from_uci("b5b8").unwrap();
+        assert!(pos.raw_move_legal(m), "Rxb8+ must be legal");
+        assert!(pos.make_child(m).is_check(), "Rxb8+ must give check");
+        let see_value = crate::move_ordering::see::see(pos.board(), m, &params);
+        assert!(
+            see_value < 0,
+            "the fixture needs a SEE-negative capture, got {see_value}"
+        );
+        // The pin really holds: black's only answers to the check are king moves.
+        let child = pos.make_child(m);
+        assert!(child.is_check());
+        for reply in child.legal_moves().iter() {
+            assert_ne!(
+                reply.to_uci().as_str(),
+                "e5b8",
+                "Bxb8 must be illegal — the bishop is pinned"
+            );
+        }
+
+        let stand_pat = Evaluator.evaluate(&pos);
+        let (v, _, see_calls, see_pruned) = q_prunes(fen, -32_001, 32_001);
+        assert!(
+            v > stand_pat + 400,
+            "the free knight must be won: stand pat {stand_pat}, qsearch {v}"
+        );
+        assert!(see_calls >= 1, "the SEE test must still be consulted");
+        assert_eq!(see_pruned, 0, "no capture may be SEE-pruned");
+    }
+
+    #[test]
+    fn no_checking_capture_is_see_pruned() {
+        // A battery over positions in which *every* capture gives check, and at
+        // least one of them loses material on paper. Each fixture is validated
+        // first, so the counter assertion below is a statement about the rule
+        // and not about the position: quiescence still asks about every one of
+        // these captures, and prunes none of them. A capture may still be
+        // *rejected on its merits* inside the child node, but never skipped
+        // blind.
+        for fen in [
+            // Qf7xd7+ (the only capture) is a queen for a knight that is
+            // defended twice over.
+            "2bk4/2nr1Q2/p6B/7P/4P1P1/N6B/7K/R7 w - - 6 55",
+            // Rxd7+ walks into the bishop on d7 and the king on b7.
+            "5n1r/1k1b4/5p1p/7p/P1K5/RP1R4/8/8 w - - 2 55",
+            // Nxb4+ is a knight for a pawn defended by two bishops.
+            "8/r7/1k2P3/b1p4N/1n4R1/6Pp/b7/3K4 w - - 4 55",
+            // Rxe5+ hangs the rook to the bishop on b4.
+            "4kr2/8/r2p4/b3b1RP/p2pB3/2nK4/P7/8 w - - 4 53",
+            // Rxf4+ is a rook for a pawn that is defended.
+            "5k2/8/3R4/p3p2P/P2Npb2/7P/5RK1/1r6 w - - 3 52",
+            // And the pinned bishop from the score test above.
+            "1n2k3/8/8/1R2b3/8/8/8/4R1K1 w - - 0 1",
+        ] {
+            let pos = Position::from_fen(fen).unwrap();
+            let params = crate::evaluation::EvalParams::default();
+            let captures = pos.capture_moves();
+            assert!(!captures.is_empty(), "{fen}: the fixture needs a capture");
+            let mut losing = 0;
+            for m in captures.iter() {
+                assert!(
+                    pos.make_child(m).is_check(),
+                    "{fen} {}: the fixture needs every capture to give check",
+                    m.to_uci()
+                );
+                if crate::move_ordering::see::see(pos.board(), m, &params) < 0 {
+                    losing += 1;
+                }
+            }
+            assert!(
+                losing > 0,
+                "{fen}: the fixture needs a capture that loses material"
+            );
+
+            let (_, _, see_calls, see_pruned) = q_prunes(fen, -32_001, 32_001);
+            assert!(see_calls >= 1, "{fen}: the SEE test was never consulted");
+            assert_eq!(
+                see_pruned, 0,
+                "{fen}: a capture that gives check must never be SEE-pruned"
+            );
+        }
     }
 
     // --- Syzygy -------------------------------------------------------------

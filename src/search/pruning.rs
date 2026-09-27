@@ -120,11 +120,15 @@ mod tests {
 
     #[test]
     fn depths_are_sane() {
-        assert!(FUTILITY_DEPTH >= RAZOR_DEPTH);
-        assert!(RFP_DEPTH > FUTILITY_DEPTH);
-        assert!(NULL_MOVE_MIN_DEPTH >= 2);
-        assert!(PROBCUT_DEPTH >= 5, "probcut needs a deep enough probe");
-        assert!(RAZOR_DEPTH < PROBCUT_DEPTH);
+        // Compile-time constants, so the relationships are checked by the
+        // compiler rather than at run time.
+        const {
+            assert!(FUTILITY_DEPTH >= RAZOR_DEPTH);
+            assert!(RFP_DEPTH > FUTILITY_DEPTH);
+            assert!(NULL_MOVE_MIN_DEPTH >= 2);
+            assert!(PROBCUT_DEPTH >= 5, "probcut needs a deep enough probe");
+            assert!(RAZOR_DEPTH < PROBCUT_DEPTH);
+        }
     }
 
     #[test]

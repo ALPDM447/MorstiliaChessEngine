@@ -202,6 +202,10 @@ pub const BISHOP_ATTACKS: [Bitboard; 64] = sliding_table(&BISHOP_DIRS);
 pub const ROOK_ATTACKS: [Bitboard; 64] = sliding_table(&ROOK_DIRS);
 /// `[color][square]`
 pub const PAWN_ATTACKS: [[Bitboard; 64]; 2] = [pawn_attack_table(1), pawn_attack_table(-1)];
+// These stay `const` rather than `static`: the table is built by a `const fn`
+// so its entries are verified by the const evaluator, and `tests/nnue_tables.rs`
+// reads `RAY_PASS_BB` inside a `const` item, which a `static` cannot satisfy.
+#[allow(clippy::large_const_arrays)]
 pub const RAY_PASS_BB: [[Bitboard; 64]; 64] = ray_pass_table();
 pub const PAWN_PAIR_BB: [Bitboard; 64] = pawn_pair_table();
 
@@ -328,7 +332,7 @@ mod tests {
     /// engine's own objects. The whole-table check in
     /// `tests/nnue_tables.rs` compares every entry; these tests keep the
     /// hand-checked landmarks readable and name the geometry they describe.
-
+    ///
     /// `d4` is index 27, `a1` is 0.
     const D4: usize = 27;
     const A1: usize = 0;

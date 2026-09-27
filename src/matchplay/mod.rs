@@ -214,7 +214,7 @@ pub fn load_syzygy(path: Option<&str>) -> (Option<Arc<crate::endgame::Syzygy>>, 
                     .first()
                     .cloned()
                     .unwrap_or_else(|| "load failed".to_string());
-                (None, format!("{warn}"))
+                (None, warn.to_string())
             }
         }
     }
@@ -375,6 +375,11 @@ fn splitmix_mix(mut z: u64) -> u64 {
 }
 
 /// Plays one game from a suite position with two engine configurations.
+///
+/// The argument list mirrors the `MatchConfig` fields one-for-one; bundling them
+/// into a struct is a deliberate no-go for now because the call sites read as a
+/// spec of a single game.
+#[allow(clippy::too_many_arguments)]
 pub fn play_match_game(
     white: &EngineConfig,
     black: &EngineConfig,
@@ -392,7 +397,7 @@ pub fn play_match_game(
     // game would see it (used for honest threefold detection).
     let (mut pos, mut history, mut moves) = suite.position_of(opening_idx);
 
-    let white_was_a = !alternate_colors || game_no % 2 == 0;
+    let white_was_a = !alternate_colors || game_no.is_multiple_of(2);
 
     let mut white_searcher = Searcher::with_params(white.hash_mb, white.params.clone());
     let mut black_searcher = Searcher::with_params(black.hash_mb, black.params.clone());
@@ -813,14 +818,14 @@ pub fn run_match(
         apply_result(&mut wdl, candidate_result_std(g, cfg.candidate));
     }
     let mut sprt_state: Option<Sprt> = cfg.sprt.map(Sprt::new);
-    if let Some(r) = resume {
-        if let (Some(s), Some(sc)) = (&r.sprt, cfg.sprt) {
-            sprt_state = Some(Sprt {
-                config: sc,
-                games: s.games,
-                llr: s.llr,
-            });
-        }
+    if let Some(r) = resume
+        && let (Some(s), Some(sc)) = (&r.sprt, cfg.sprt)
+    {
+        sprt_state = Some(Sprt {
+            config: sc,
+            games: s.games,
+            llr: s.llr,
+        });
     }
     // A resumed, already-decided SPRT stops immediately.
     let sprt_finished = sprt_state
@@ -831,7 +836,7 @@ pub fn run_match(
     let mut completed = games.len();
 
     'outer: while completed < cfg.games && !sprt_finished {
-        if stop.map_or(false, |s| s.load(Ordering::Relaxed)) {
+        if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
             break 'outer;
         }
         let batch = (cfg.games - completed).min(cfg.parallel.max(1));
@@ -1097,10 +1102,10 @@ fn collect_sources(dir: &Path, rel: &str, out: &mut Vec<(String, Vec<u8>)>) {
         let rel_path = format!("{rel}/{name}");
         if path.is_dir() {
             collect_sources(&path, &rel_path, out);
-        } else if name.ends_with(".rs") {
-            if let Ok(bytes) = fs::read(&path) {
-                out.push((rel_path, bytes));
-            }
+        } else if name.ends_with(".rs")
+            && let Ok(bytes) = fs::read(&path)
+        {
+            out.push((rel_path, bytes));
         }
     }
 }

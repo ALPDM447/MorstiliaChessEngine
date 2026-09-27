@@ -115,9 +115,8 @@ fn header(version: u32, network_hash: u32, desc: &str) -> Vec<u8> {
 fn real_header() -> Vec<u8> {
     use std::io::Read as _;
     let mut f = std::fs::File::open(net_path()).unwrap();
-    let mut buf = Vec::new();
     // The description is short; 4 KiB is comfortably past its end.
-    buf.resize(4096, 0);
+    let mut buf = vec![0; 4096];
     let n = f.read(&mut buf).unwrap();
     buf.truncate(n);
     buf

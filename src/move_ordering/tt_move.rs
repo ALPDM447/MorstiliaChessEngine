@@ -127,8 +127,12 @@ mod tests {
 
     #[test]
     fn tiers_are_ordered() {
-        assert!(TT_TIER > CAPTURE_TIER);
-        assert!(CAPTURE_TIER > KILLER1_TIER);
-        assert!(KILLER1_TIER > KILLER2_TIER);
+        // Tier values are compile-time constants, so the ordering is checked by
+        // the compiler rather than at run time.
+        const {
+            assert!(TT_TIER > CAPTURE_TIER);
+            assert!(CAPTURE_TIER > KILLER1_TIER);
+            assert!(KILLER1_TIER > KILLER2_TIER);
+        }
     }
 }

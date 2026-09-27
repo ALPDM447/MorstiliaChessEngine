@@ -68,7 +68,7 @@ const fn combine_hash(parts: [u32; 3]) -> u32 {
     let mut hash = 0u32;
     let mut i = 0;
     while i < parts.len() {
-        hash = (hash << 1) | (hash >> 31);
+        hash = hash.rotate_left(1);
         hash ^= parts[i];
         i += 1;
     }
@@ -200,7 +200,7 @@ pub struct Affine<const IN: usize, const OUT: usize> {
 
 impl<const IN: usize, const OUT: usize> Affine<IN, OUT> {
     /// Row stride of the weight block.
-    const PAD_IN: usize = (IN + PAD_QUANTUM - 1) / PAD_QUANTUM * PAD_QUANTUM;
+    const PAD_IN: usize = IN.div_ceil(PAD_QUANTUM) * PAD_QUANTUM;
 
     /// Reads `OUT` `i32` biases then `OUT * PAD_IN` `i8` weights, both raw
     /// little-endian (the layer stacks are *not* LEB128-compressed).
@@ -483,6 +483,7 @@ mod tests {
                 .collect(),
         };
         // Pointer arithmetic is in *bytes*, so each row is `idx * len * size_of`.
+        // The `i8` threat weights are one byte each, hence the `* 1`.
         let base = ft.psq_weights.as_ptr() as usize;
         let w = ft.weight_row(idx);
         assert_eq!(w.len(), L1);
@@ -490,7 +491,7 @@ mod tests {
         let base = ft.other_weights.as_ptr() as usize;
         let o = ft.other_weight_row(idx);
         assert_eq!(o.len(), L1);
-        assert_eq!(o.as_ptr() as usize - base, idx * L1 * 1);
+        assert_eq!(o.as_ptr() as usize - base, idx * L1);
         let base = ft.psqt_weights.as_ptr() as usize;
         let p = ft.psqt_weight_row(idx);
         assert_eq!(p.len(), PSQT_BUCKETS);
@@ -535,9 +536,9 @@ mod tests {
         layer.propagate(&input, &mut out);
         for j in 0..OUT {
             let mut expect = [10i32, -10][j];
-            for i in 0..IN {
-                expect += i32::from(layer.weights[j * Affine::<IN, OUT>::PAD_IN + i])
-                    * i32::from(input[i]);
+            for (i, &x) in input.iter().enumerate().take(IN) {
+                expect +=
+                    i32::from(layer.weights[j * Affine::<IN, OUT>::PAD_IN + i]) * i32::from(x);
             }
             assert_eq!(out[j], expect, "output {j}");
         }

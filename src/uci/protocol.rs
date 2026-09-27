@@ -389,12 +389,11 @@ impl UciEngine {
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }
-        if let Some(back) = self.searcher_back.take() {
-            if let Ok(mut guard) = back.lock() {
-                if let Some(s) = guard.take() {
-                    self.searcher = Some(s);
-                }
-            }
+        if let Some(back) = self.searcher_back.take()
+            && let Ok(mut guard) = back.lock()
+            && let Some(s) = guard.take()
+        {
+            self.searcher = Some(s);
         }
     }
 
@@ -550,15 +549,15 @@ fn write_eval_breakdown(
 fn auto_book_paths() -> Vec<PathBuf> {
     let mut cands: Vec<PathBuf> = Vec::new();
     let mut roots: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            roots.push(dir.to_path_buf());
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        roots.push(dir.to_path_buf());
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        if !roots.iter().any(|r| r == &cwd) {
-            roots.push(cwd);
-        }
+    if let Ok(cwd) = std::env::current_dir()
+        && !roots.iter().any(|r| r == &cwd)
+    {
+        roots.push(cwd);
     }
     for root in roots {
         let book_dir = root.join("book");
@@ -771,7 +770,7 @@ mod tests {
         let (s, _) = drive(&["uci", "isready"]);
         let lines: Vec<&str> = s.lines().collect();
         assert_eq!(lines[0], format!("id name {}", env!("MORSTILIA_NAME")));
-        assert!(lines.iter().any(|l| *l == "uciok"));
+        assert!(lines.contains(&"uciok"));
         assert!(lines.iter().any(|l| l.starts_with("option name Hash")));
         // stdout contract: only the four allowed line kinds.
         for l in s.lines() {

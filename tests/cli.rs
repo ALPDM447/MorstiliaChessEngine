@@ -306,8 +306,8 @@ fn bad_invocation_is_an_error() {
 fn uci_handshake_produces_clean_stdout() {
     let out = drive_uci(&["uci", "isready", "position startpos", "go depth 2", "quit"]);
     let lines: Vec<&str> = out.lines().collect();
-    assert!(lines.iter().any(|l| *l == "uciok"), "no uciok: {out}");
-    assert!(lines.iter().any(|l| *l == "readyok"), "no readyok: {out}");
+    assert!(lines.contains(&"uciok"), "no uciok: {out}");
+    assert!(lines.contains(&"readyok"), "no readyok: {out}");
     assert!(
         lines.iter().any(|l| l.starts_with("bestmove ")),
         "no bestmove: {out}"
@@ -604,8 +604,7 @@ fn run_capturing(args: &[&str]) -> (String, String, Option<i32>) {
 fn final_score(out: &str) -> String {
     let line = out
         .lines()
-        .filter(|l| l.starts_with("info depth"))
-        .next_back()
+        .rfind(|l| l.starts_with("info depth"))
         .unwrap_or_else(|| panic!("no info line in: {out}"));
     let mut it = line.split_whitespace();
     while let Some(t) = it.next() {

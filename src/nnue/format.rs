@@ -372,10 +372,14 @@ mod tests {
     }
 
     /// Builds a valid LEB128 block the way the trainer's writer does.
-    fn leb_block<T: LeBytes, I: IntoIterator<Item = i32>>(values: I) -> Vec<u8> {
+    ///
+    /// The payload is always i32-encoded; the element type only names the
+    /// destination slice the block will later be read into, so it carries no
+    /// type-level information here.
+    fn leb_block<I: IntoIterator<Item = i32>>(values: I) -> Vec<u8> {
         let mut payload = Vec::new();
         for v in values {
-            let mut value = v as i32;
+            let mut value = v;
             loop {
                 let byte = (value & 0x7f) as u8;
                 value >>= 7;
@@ -402,7 +406,7 @@ mod tests {
     fn leb128_round_trips_positive_negative_and_extreme_values() {
         // i16 range edges plus values needing 2 and 3 bytes.
         let values: [i32; 10] = [0, 1, -1, 63, 64, -64, -65, 8191, -8192, i16::MIN as i32];
-        let block = leb_block::<i16, _>(values);
+        let block = leb_block(values);
         let mut r = reader(&block);
         let mut out = vec![0i16; values.len()];
         r.read_leb128(&mut out, "test").unwrap();
@@ -412,7 +416,7 @@ mod tests {
     #[test]
     fn leb128_i32_uses_more_than_two_bytes() {
         let values: [i32; 6] = [0, 1, -1, 1 << 20, -(1 << 20), 0x3fff_ffff];
-        let block = leb_block::<i32, _>(values);
+        let block = leb_block(values);
         let mut r = reader(&block);
         let mut out = vec![0i32; values.len()];
         r.read_leb128(&mut out, "test").unwrap();
@@ -430,7 +434,7 @@ mod tests {
     #[test]
     fn leb128_rejects_a_wrong_byte_count() {
         // Claim one byte more than the payload holds.
-        let mut block = leb_block::<i16, _>([1i32, 2]);
+        let mut block = leb_block([1i32, 2]);
         let n = u32::from_le_bytes([
             block[LEB128_MAGIC.len()],
             block[LEB128_MAGIC.len() + 1],
@@ -444,7 +448,7 @@ mod tests {
         assert!(err.to_string().contains("shorter than declared"), "{err}");
 
         // ... and one byte less.
-        let mut block = leb_block::<i16, _>([1i32, 2]);
+        let mut block = leb_block([1i32, 2]);
         block[LEB128_MAGIC.len()] = (n - 1) as u8;
         let mut r = reader(&block);
         let err = r.read_leb128::<i16>(&mut out, "test").unwrap_err();
@@ -453,7 +457,7 @@ mod tests {
 
     #[test]
     fn leb128_rejects_a_truncated_payload() {
-        let block = leb_block::<i16, _>([1i32, 2, 3]);
+        let block = leb_block([1i32, 2, 3]);
         let mut r = reader(&block[..block.len() - 1]);
         let mut out = [0i16; 3];
         let err = r.read_leb128(&mut out, "test").unwrap_err();

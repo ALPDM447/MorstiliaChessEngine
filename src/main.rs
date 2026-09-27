@@ -462,73 +462,71 @@ fn cmd_bench(args: &[String], i: usize) -> anyhow::Result<()> {
             nodes * 1000 / time_ms as u64
         };
         println!("{name:12} nodes {nodes:>10} time {time_ms:>6} ms nps {nps:>9} best {best}");
-        if stats {
-            if let Some(r) = result.as_ref().filter(|r| !r.is_none()) {
-                let s = &r.stats;
-                println!(
-                    "  stats depth {} qnodes {} tt_probe {} tt_hit {:.1}% tt_cut {:.1}% \
+        if stats && let Some(r) = result.as_ref().filter(|r| !r.is_none()) {
+            let s = &r.stats;
+            println!(
+                "  stats depth {} qnodes {} tt_probe {} tt_hit {:.1}% tt_cut {:.1}% \
                      beta_cut {} first_cut {:.1}% avg_moves {:.2} see {} prune {:.1}% tt_stores {}",
-                    r.depth,
-                    s.qsearch_nodes,
-                    s.tt_probes,
+                r.depth,
+                s.qsearch_nodes,
+                s.tt_probes,
+                s.tt_hit_pct(),
+                s.tt_cutoff_pct(),
+                s.beta_cutoffs,
+                s.first_move_cutoff_pct(),
+                s.avg_moves_until_cutoff(),
+                s.see_calls,
+                s.see_prune_pct(),
+                r.tt_stores,
+            );
+            println!(
+                "  prune null {}/{} lmr {}/{} fut {} rfp {} razor {}/{} probcut {}/{} \
+                     pruned {} ebf {:.2}",
+                s.null_cutoffs,
+                s.null_probes,
+                s.lmr_researched,
+                s.lmr_reduced,
+                s.futility_pruned,
+                s.rfp_pruned,
+                s.razor_cutoffs,
+                s.razor_attempts,
+                s.probcut_cutoffs,
+                s.probcut_attempts,
+                s.total_pruned(),
+                r.ebf(),
+            );
+            if s.tb_probes > 0 {
+                println!(
+                    "  tb probe {} hit {} ({:.1}%) win {} draw {} loss {} cursed {}",
+                    s.tb_probes,
+                    s.tb_hits,
+                    100.0 * s.tb_hits as f64 / s.tb_probes as f64,
+                    s.tb_wins,
+                    s.tb_draws,
+                    s.tb_losses,
+                    s.tb_cursed,
+                );
+            }
+            if r.threads > 1 {
+                println!(
+                    "  smp threads {} workers {} rootmoves {} tt_hit {:.1}% tt_cut {:.1}%",
+                    r.threads,
+                    r.workers.len(),
+                    r.root_moves,
                     s.tt_hit_pct(),
                     s.tt_cutoff_pct(),
-                    s.beta_cutoffs,
-                    s.first_move_cutoff_pct(),
-                    s.avg_moves_until_cutoff(),
-                    s.see_calls,
-                    s.see_prune_pct(),
-                    r.tt_stores,
                 );
-                println!(
-                    "  prune null {}/{} lmr {}/{} fut {} rfp {} razor {}/{} probcut {}/{} \
-                     pruned {} ebf {:.2}",
-                    s.null_cutoffs,
-                    s.null_probes,
-                    s.lmr_researched,
-                    s.lmr_reduced,
-                    s.futility_pruned,
-                    s.rfp_pruned,
-                    s.razor_cutoffs,
-                    s.razor_attempts,
-                    s.probcut_cutoffs,
-                    s.probcut_attempts,
-                    s.total_pruned(),
-                    r.ebf(),
-                );
-                if s.tb_probes > 0 {
+                let wall = r.time_ms.max(1);
+                for (i, w) in r.workers.iter().enumerate() {
                     println!(
-                        "  tb probe {} hit {} ({:.1}%) win {} draw {} loss {} cursed {}",
-                        s.tb_probes,
-                        s.tb_hits,
-                        100.0 * s.tb_hits as f64 / s.tb_probes as f64,
-                        s.tb_wins,
-                        s.tb_draws,
-                        s.tb_losses,
-                        s.tb_cursed,
+                        "    worker {}{} nodes {} time {} ms idle {} ms depth {}",
+                        if w.main { "*" } else { "" },
+                        i,
+                        w.nodes,
+                        w.time_ms,
+                        wall.saturating_sub(w.time_ms),
+                        w.depth,
                     );
-                }
-                if r.threads > 1 {
-                    println!(
-                        "  smp threads {} workers {} rootmoves {} tt_hit {:.1}% tt_cut {:.1}%",
-                        r.threads,
-                        r.workers.len(),
-                        r.root_moves,
-                        s.tt_hit_pct(),
-                        s.tt_cutoff_pct(),
-                    );
-                    let wall = r.time_ms.max(1);
-                    for (i, w) in r.workers.iter().enumerate() {
-                        println!(
-                            "    worker {}{} nodes {} time {} ms idle {} ms depth {}",
-                            if w.main { "*" } else { "" },
-                            i,
-                            w.nodes,
-                            w.time_ms,
-                            wall.saturating_sub(w.time_ms),
-                            w.depth,
-                        );
-                    }
                 }
             }
         }

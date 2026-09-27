@@ -150,9 +150,9 @@ pub fn blend(out: NetworkOutput, meta: &EvalMeta) -> i32 {
 
     let nnue = i64::from(out.raw());
     let complexity = i64::from((out.psqt - out.positional).abs());
-    // `optimism` is zero throughout the search, so its own update and its
-    // contribution below are both no-ops — kept explicit for the record.
-    debug_assert_eq!(0i64 + 0i64 * complexity / 476, 0);
+    // Stockfish's `optimism` term is absent on purpose: `optimism` is zero
+    // throughout this engine's search, so the term would add exactly zero. The
+    // complexity tax below is the whole of the damping.
     let nnue = nnue - nnue * complexity / COMPLEXITY_SHIFT;
 
     let material = PAWN_MATERIAL * meta.pawns + meta.non_pawn_material;

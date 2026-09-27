@@ -68,7 +68,11 @@ impl OrderingTables {
 /// and `ant` are the current ply and the previous two move contexts (only
 /// used for killer and continuation lookups). `p` carries the tunable material
 /// values that drive the MVV-LVA tiers (the searcher's shared parameter set).
+// The scoring context (position, TT move, tables, ply, the two previous move
+// contexts, the eval parameters) is exactly the state a move-ordering decision
+// depends on; a struct here would only forward all of it unchanged.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub fn score_move(
     pos: &Position,
     m: RawMove,

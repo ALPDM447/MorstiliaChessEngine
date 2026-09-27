@@ -54,16 +54,18 @@ pub fn make_index(
     paired_color: Color,
     ksq: usize,
 ) -> u16 {
-    // The two pawns of a pair are always on different squares and different
-    // files, so `id_a != id_b` and the address below stays inside the block.
-    // Pairing a pawn with itself would run one past the end of the block.
-    debug_assert!(from != to, "a pawn cannot be its own neighbour");
     let orientation = full_threats::ORIENT_TBL[ksq] ^ (56 * perspective.idx());
     let from_oriented = from ^ orientation;
     let to_oriented = to ^ orientation;
 
     let id_a = make_pawn_id(color.idx() ^ perspective.idx(), from_oriented);
     let id_b = make_pawn_id(paired_color.idx() ^ perspective.idx(), to_oriented);
+
+    // Same-square cross-colour pairs are valid in the abstract feature space
+    // because they still correspond to distinct pawn IDs. The only invalid
+    // pair is a pawn ID paired with itself.
+    debug_assert!(id_a != id_b, "a pawn cannot be paired with itself");
+
     let hi = if id_a > id_b { id_a } else { id_b };
     let lo = if id_a > id_b { id_b } else { id_a };
 
@@ -81,6 +83,7 @@ pub fn append_active_indices(perspective: Color, board: &Board, active: &mut Ind
         let from = bb.trailing_zeros() as usize;
         bb &= bb - 1;
         let band = pawn_pair_bb(from);
+
         let mut ww = band & bb;
         while ww != 0 {
             active.push(make_index(
@@ -93,6 +96,7 @@ pub fn append_active_indices(perspective: Color, board: &Board, active: &mut Ind
             ));
             ww &= ww - 1;
         }
+
         let mut wb = band & black;
         while wb != 0 {
             active.push(make_index(
@@ -112,6 +116,7 @@ pub fn append_active_indices(perspective: Color, board: &Board, active: &mut Ind
         let from = bb.trailing_zeros() as usize;
         bb &= bb - 1;
         let band = pawn_pair_bb(from);
+
         let mut bk = band & bb;
         while bk != 0 {
             active.push(make_index(
@@ -147,15 +152,18 @@ pub fn append_changed_indices(
         |updated_w: u64, updated_b: u64, pawns_w: u64, pawns_b: u64, out: &mut IndexList| {
             let unchanged = (pawns_w | pawns_b) & !(updated_w | updated_b);
             let mut u = updated_w | updated_b;
+
             while u != 0 {
                 let a = u.trailing_zeros() as usize;
                 u &= u - 1;
+
                 let mask = pawn_pair_bb(a) & (unchanged | u);
                 let a_col = if pawns_b & (1u64 << a) != 0 {
                     Color::Black
                 } else {
                     Color::White
                 };
+
                 let mut pb = pawns_b & mask;
                 while pb != 0 {
                     out.push(make_index(
@@ -168,6 +176,7 @@ pub fn append_changed_indices(
                     ));
                     pb &= pb - 1;
                 }
+
                 let mut pw = pawns_w & mask;
                 while pw != 0 {
                     out.push(make_index(
@@ -190,6 +199,7 @@ pub fn append_changed_indices(
         black_after,
         added,
     );
+
     generate(
         white_before & !white_after,
         black_before & !black_after,
@@ -224,26 +234,33 @@ mod tests {
     #[test]
     fn a_pair_is_unordered() {
         let ksq = A1;
+
         let a = make_index(Color::White, Color::White, A4, B4, Color::White, ksq);
+
         let b = make_index(Color::White, Color::White, B4, A4, Color::White, ksq);
+
         assert_eq!(a, b, "swapping the two pawns must not change the index");
     }
 
     #[test]
     fn indices_stay_inside_the_pawn_pair_block() {
-        // `from != to` is a precondition: a pawn never pairs with itself, and
-        // with a single id the formula walks straight off the end of the block.
+        // Same-square cross-colour pairs are valid in the abstract feature
+        // space because they map to distinct pawn IDs. Same-square same-colour
+        // pairs are excluded because they would represent the same pawn twice.
         for ksq in 0..64 {
             for from in A2..=H7 {
                 for to in A2..=H7 {
-                    if from == to {
-                        continue;
-                    }
                     for c in Color::ALL {
                         for pc in Color::ALL {
+                            let same_pawn = from == to && c == pc;
+                            if same_pawn {
+                                continue;
+                            }
+
                             let idx = make_index(Color::White, c, from, to, pc, ksq) as usize;
+
                             assert!(
-                                idx >= INDEX_BASE && idx < INDEX_BASE + DIMENSIONS,
+                                (INDEX_BASE..INDEX_BASE + DIMENSIONS).contains(&idx),
                                 "{c:?}/{pc:?} {from}->{to} ksq {ksq} -> {idx}"
                             );
                         }
@@ -260,32 +277,40 @@ mod tests {
         // exactly the canonical upper-triangular address of that pair — which
         // proves both that nothing collides and that all 4560 are reachable.
         let mut canonical: HashSet<u32> = HashSet::new();
+
         for hi in 1..PAWN_IDS {
             for lo in 0..hi {
                 canonical.insert((hi * (hi - 1) / 2 + lo + INDEX_BASE) as u32);
             }
         }
+
         assert_eq!(canonical.len(), DIMENSIONS, "4560 distinct pair features");
 
         // A king square on the a..d half gives orientation 0, which already
         // reaches all 96 pawn ids.
         for from in A2..=H7 {
             for to in A2..=H7 {
-                if from == to {
-                    continue;
-                }
                 for c in Color::ALL {
                     for pc in Color::ALL {
                         let id_a = make_pawn_id(c.idx(), from) as usize;
                         let id_b = make_pawn_id(pc.idx(), to) as usize;
+
+                        if id_a == id_b {
+                            continue;
+                        }
+
                         let (hi, lo) = if id_a > id_b {
                             (id_a, id_b)
                         } else {
                             (id_b, id_a)
                         };
+
                         let want = (hi * (hi - 1) / 2 + lo + INDEX_BASE) as u32;
+
                         let got = make_index(Color::White, c, from, to, pc, A1);
+
                         assert_eq!(u32::from(got), want, "{c:?} {from} with {pc:?} {to}");
+
                         assert!(canonical.contains(&u32::from(got)));
                     }
                 }
@@ -296,6 +321,7 @@ mod tests {
         // two pawns can never share a square on a real board; they are what
         // makes the count 4560 rather than 4512.
         let same = make_index(Color::White, Color::White, A2, A2, Color::Black, A1);
+
         assert!(canonical.contains(&u32::from(same)));
     }
 
@@ -303,15 +329,18 @@ mod tests {
     fn the_block_is_filled_exactly() {
         let mut best = 0usize;
         let mut worst = usize::MAX;
+
         for ksq in 0..64 {
             for c in Color::ALL {
                 for pc in Color::ALL {
                     for from in A2..=H7 {
                         for to in A2..=H7 {
-                            if from == to {
+                            if from == to && c == pc {
                                 continue;
                             }
+
                             let idx = make_index(Color::White, c, from, to, pc, ksq) as usize;
+
                             best = best.max(idx);
                             worst = worst.min(idx);
                         }
@@ -319,7 +348,9 @@ mod tests {
                 }
             }
         }
+
         assert_eq!(best, INDEX_BASE + DIMENSIONS - 1, "the top of the block");
+
         assert_eq!(worst, INDEX_BASE, "the bottom of the block");
     }
 
@@ -331,25 +362,33 @@ mod tests {
         // therefore give the three chain links (a4,b4) (b4,c4) (c4,d4) and not
         // the three non-adjacent combinations.
         let pos = Position::from_fen("4k3/8/8/8/PPPP4/8/8/4K3 w - - 0 1").unwrap();
+
         let board = crate::nnue::board::Board::from_position(&pos);
         let mut active = IndexList::new();
+
         append_active_indices(Color::White, &board, &mut active);
+
         assert_eq!(active.size(), 3, "only neighbouring files pair up");
+
         let ksq = board.king_square(Color::White);
+
         for i in active.as_slice() {
             assert!(
                 active.as_slice().iter().filter(|j| *j == i).count() == 1,
                 "index {i} appears twice"
             );
         }
+
         let expect = [
             make_index(Color::White, Color::White, A4, B4, Color::White, ksq),
             make_index(Color::White, Color::White, B4, C4, Color::White, ksq),
             make_index(Color::White, Color::White, C4, D4, Color::White, ksq),
         ];
+
         for e in expect {
             assert!(active.as_slice().contains(&e), "missing {e}");
         }
+
         // a4 and c4 are two files apart, so they must not pair.
         assert!(!active.as_slice().contains(&make_index(
             Color::White,
@@ -363,9 +402,12 @@ mod tests {
         // Black-to-move perspective sees exactly the same three pairs: the
         // king square only rotates the board.
         let pos_b = Position::from_fen("4k3/8/8/8/PPPP4/8/8/4K3 b - - 0 1").unwrap();
+
         let board_b = crate::nnue::board::Board::from_position(&pos_b);
         let mut active_b = IndexList::new();
+
         append_active_indices(Color::Black, &board_b, &mut active_b);
+
         assert_eq!(active_b.size(), 3);
 
         // A black pawn inside the white band pairs with it, and only with the
@@ -373,11 +415,16 @@ mod tests {
         // but outside c4's and d4's, so `pPPP4` replaces no pair and adds just
         // the one mixed feature (b4, a4) — three in total, not four.
         let pos_m = Position::from_fen("4k3/8/8/8/pPPP4/8/8/4K3 w - - 0 1").unwrap();
+
         let board_m = crate::nnue::board::Board::from_position(&pos_m);
         let mut active_m = IndexList::new();
+
         append_active_indices(Color::White, &board_m, &mut active_m);
+
         assert_eq!(active_m.size(), 3);
+
         let ksq = board_m.king_square(Color::White);
+
         assert!(active_m.as_slice().contains(&make_index(
             Color::White,
             Color::White,
@@ -386,15 +433,21 @@ mod tests {
             Color::Black,
             ksq
         )));
+
         // A mixed pair is always attributed to the *white* attacker, so a lone
         // black pawn beside a white one pairs, and a black pawn two files away
         // does not: `pP6` is a4=p b4=P, `pP1P4` is a4=p b4=P d4=P.
         let pos_n = Position::from_fen("4k3/8/8/8/pP6/8/8/4K3 w - - 0 1").unwrap();
+
         let board_n = crate::nnue::board::Board::from_position(&pos_n);
         let mut active_n = IndexList::new();
+
         append_active_indices(Color::White, &board_n, &mut active_n);
+
         assert_eq!(active_n.size(), 1);
+
         let ksq = board_n.king_square(Color::White);
+
         assert!(active_n.as_slice().contains(&make_index(
             Color::White,
             Color::White,
@@ -405,19 +458,27 @@ mod tests {
         )));
 
         let pos_n2 = Position::from_fen("4k3/8/8/8/pP1P4/8/8/4K3 w - - 0 1").unwrap();
+
         let board_n2 = crate::nnue::board::Board::from_position(&pos_n2);
         let mut active_n2 = IndexList::new();
+
         append_active_indices(Color::White, &board_n2, &mut active_n2);
+
         assert_eq!(active_n2.size(), 1, "a4 and d4 are two files apart");
 
         // Same-colour black pairs come from the second scan: black a4 and b4
         // plus a white c4 give the black pair (a4,b4) and the mixed (c4,b4).
         let pos_p = Position::from_fen("4k3/8/8/8/ppP5/8/8/4K3 w - - 0 1").unwrap();
+
         let board_p = crate::nnue::board::Board::from_position(&pos_p);
         let mut active_p = IndexList::new();
+
         append_active_indices(Color::White, &board_p, &mut active_p);
+
         assert_eq!(active_p.size(), 2);
+
         let ksq = board_p.king_square(Color::White);
+
         assert!(active_p.as_slice().contains(&make_index(
             Color::White,
             Color::Black,
@@ -426,6 +487,7 @@ mod tests {
             Color::Black,
             ksq
         )));
+
         assert!(active_p.as_slice().contains(&make_index(
             Color::White,
             Color::White,
@@ -439,7 +501,9 @@ mod tests {
     #[test]
     fn a_pawn_push_only_touches_its_own_pairs() {
         let pos = Position::from_fen("4k3/8/8/8/PPPP4/8/8/4K3 w - - 0 1").unwrap();
+
         let board = crate::nnue::board::Board::from_position(&pos);
+
         let before = {
             let mut l = IndexList::new();
             append_active_indices(Color::White, &board, &mut l);
@@ -450,6 +514,7 @@ mod tests {
         // a5 is still inside b4's band. b4's other partners are untouched.
         let child = pos.make_child(pos.raw_move_from_uci("a4a5").unwrap());
         let after_board = crate::nnue::board::Board::from_position(&child);
+
         let diff = DirtyPawnPairs {
             before: [board.pawns(Color::White), board.pawns(Color::Black)],
             after: [
@@ -457,14 +522,20 @@ mod tests {
                 after_board.pawns(Color::Black),
             ],
         };
+
         let ksq = board.king_square(Color::White);
         let mut removed = IndexList::new();
         let mut added = IndexList::new();
+
         append_changed_indices(Color::White, ksq, &diff, &mut removed, &mut added);
+
         assert_eq!(removed.size(), 1);
         assert_eq!(added.size(), 1);
+
         let a4_b4 = make_index(Color::White, Color::White, A4, B4, Color::White, ksq);
+
         let a5_b4 = make_index(Color::White, Color::White, 32, B4, Color::White, ksq);
+
         assert_eq!(removed[0], a4_b4, "(a4,b4) is destroyed");
         assert_eq!(added[0], a5_b4, "(a5,b4) is created");
         assert!(before.as_slice().contains(&a4_b4));
@@ -491,14 +562,19 @@ mod tests {
             "8/8/8/8/p1p1p1p1/P1P1P1P1/8/4K2k w - - 0 1",
             "rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 2",
         ];
+
         let mut checked = 0usize;
+
         for fen in FENS {
             let pos = Position::from_fen(fen).unwrap();
             let board = crate::nnue::board::Board::from_position(&pos);
+
             for perspective in Color::ALL {
                 let ksq_before = board.king_square(perspective);
                 let mut before = IndexList::new();
+
                 append_active_indices(perspective, &board, &mut before);
+
                 let before_sorted: Vec<u16> = {
                     let mut v = before.as_slice().to_vec();
                     v.sort_unstable();
@@ -508,15 +584,19 @@ mod tests {
                 for m in pos.legal_moves().iter() {
                     let child = pos.make_child(m);
                     let cb = crate::nnue::board::Board::from_position(&child);
+
                     if cb.king_square(perspective) != ksq_before {
                         continue;
                     }
+
                     let diff = DirtyPawnPairs {
                         before: [board.pawns(Color::White), board.pawns(Color::Black)],
                         after: [cb.pawns(Color::White), cb.pawns(Color::Black)],
                     };
+
                     let mut removed = IndexList::new();
                     let mut added = IndexList::new();
+
                     append_changed_indices(
                         perspective,
                         ksq_before,
@@ -524,10 +604,13 @@ mod tests {
                         &mut removed,
                         &mut added,
                     );
+
                     checked += 1;
 
                     let mut after = IndexList::new();
+
                     append_active_indices(perspective, &cb, &mut after);
+
                     let after_sorted: Vec<u16> = {
                         let mut v = after.as_slice().to_vec();
                         v.sort_unstable();
@@ -541,21 +624,26 @@ mod tests {
                         .copied()
                         .filter(|i| !after_sorted.contains(i))
                         .collect();
+
                     let mut expect_added: Vec<u16> = after_sorted
                         .iter()
                         .copied()
                         .filter(|i| !before_sorted.contains(i))
                         .collect();
+
                     let mut got_removed = removed.as_slice().to_vec();
                     let mut got_added = added.as_slice().to_vec();
+
                     expect_removed.sort_unstable();
                     expect_added.sort_unstable();
                     got_removed.sort_unstable();
                     got_added.sort_unstable();
+
                     assert_eq!(
                         got_removed, expect_removed,
                         "{fen} {m:?} {perspective:?}: removed set differs"
                     );
+
                     assert_eq!(
                         got_added, expect_added,
                         "{fen} {m:?} {perspective:?}: added set differs"
@@ -563,20 +651,26 @@ mod tests {
                 }
             }
         }
+
         assert!(checked > 250, "only checked {checked} moves");
     }
 
     #[test]
     fn an_unchanged_pawn_set_produces_nothing() {
         let pos = Position::from_fen("4k3/8/8/8/PPPP4/8/8/4K3 w - - 0 1").unwrap();
+
         let board = crate::nnue::board::Board::from_position(&pos);
+
         let diff = DirtyPawnPairs {
             before: [board.pawns(Color::White), board.pawns(Color::Black)],
             after: [board.pawns(Color::White), board.pawns(Color::Black)],
         };
+
         let mut removed = IndexList::new();
         let mut added = IndexList::new();
+
         append_changed_indices(Color::White, A1, &diff, &mut removed, &mut added);
+
         assert!(removed.is_empty() && added.is_empty());
     }
 

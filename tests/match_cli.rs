@@ -89,7 +89,7 @@ fn small_deterministic_match_writes_a_report() {
         );
         assert!(["1-0", "0-1", "1/2-1/2"].contains(&g["outcome"].as_str().unwrap()));
     }
-    assert!(r["terminations"].as_array().unwrap().len() >= 1);
+    assert!(!r["terminations"].as_array().unwrap().is_empty());
     assert!(r["avg_plies"].as_f64().unwrap() > 0.0);
 }
 
@@ -235,7 +235,7 @@ fn bare_sprt_flag_does_not_swallow_the_next_option() {
     assert!(out.contains("sprt:"), "SPRT status printed: {out}");
     let r = parse(&rep);
     let n = r["games_completed"].as_u64().unwrap();
-    assert!(n >= 1 && n <= 2, "plays up to the cap, never more: {n}");
+    assert!((1..=2).contains(&n), "plays up to the cap, never more: {n}");
     assert!(r["sprt"].is_object(), "report carries the SPRT block: {r}");
 }
 
