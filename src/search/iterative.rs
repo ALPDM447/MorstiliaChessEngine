@@ -41,7 +41,7 @@ pub fn iterative_search(
     if let Some(net) = shared.nnue.as_deref() {
         thread.refresh_root(root, net);
     }
-    thread.evals[0] = thread.evaluate_at(root, shared, 0);
+    thread.evals[0] = thread.evaluate_at(root, shared, 0, root.is_check());
     thread.pv_len[0] = 0;
 
     let soft = limits.soft_deadline();
@@ -90,6 +90,20 @@ pub fn iterative_search(
             break;
         }
 
+        // The current iteration's root depth. Read by the singular extension
+        // margins as `-(ss->ply > rootDepth) * 38 / 43`: a node deeper than the
+        // whole search tree cannot be on the path to a real line, and extending
+        // it buys nothing.
+        thread.root_depth = depth;
+
+        // `rootScore`: the previous iteration's root score, i.e.
+        // `rootMoves[pvIdx].score` at the start of the current iteration in
+        // `sf_19`. Drives `seekMate = rootDepth >= 16 && |rootScore| >= 2000`,
+        // which gates the child reverse-futility depth bound and the singular
+        // extension gate. `-INFINITE` before the first iteration is the correct
+        // "we have no mate in sight" answer.
+        thread.root_score = if has_prev { prev_score } else { -INFINITE };
+
         // Put the previous iteration's best move first; keep the caller's
         // ordering (TT-move / captures / history) for the rest.
         let mut ordered: Vec<RawMove> = Vec::with_capacity(moves.len().saturating_add(1));
@@ -112,6 +126,16 @@ pub fn iterative_search(
         let (score, mv) = {
             let mut attempts = 0u32;
             loop {
+                // `rootDelta`: the width of the window the root is being
+                // searched with right now. The modern reduction formula divides
+                // by it (`r -= delta * 577 / rootDelta`), so it must be current
+                // for *every* attempt, not just the first — a re-search under a
+                // full window is a very different node from one under a 20
+                // centipawn aspiration. Stockfish assigns this inside its
+                // aspiration loop (`search.cpp:394`); Morstilia seeds it in
+                // [`SearchThread::new`] as well so the division is defined even
+                // for a search that never opens an aspiration window.
+                thread.root_delta = (beta - alpha).max(1);
                 let (s, m, fail_low, fail_high) =
                     root_search_depth(thread, shared, root, history, depth, &ordered, alpha, beta);
                 if thread.stopped {
@@ -153,6 +177,13 @@ pub fn iterative_search(
 
         let ply_len = thread.pv_len[0];
         pv = thread.pv_table[0][..ply_len].to_vec();
+
+        // Hand this iteration's line to the next one as its `followPV` reference
+        // (`sf_19`'s `lastIterationIdxPV`). Recorded only for iterations that
+        // completed and produced a line: a line from a previous *depth* is
+        // still the best guess available, and a line from a partial iteration
+        // is not.
+        thread.set_previous_pv(&pv);
 
         best_move = mv;
         best_score = score;
@@ -208,6 +239,8 @@ fn root_search_depth(
         thread.ctx[1] = MoveCtx::of(root, m);
 
         let score = if i == 0 {
+            // The first root move is searched with the full window: it is the
+            // move the PV will report, and its value must be exact.
             -alphabeta::alphabeta(
                 &child,
                 -beta0,
@@ -218,8 +251,11 @@ fn root_search_depth(
                 thread,
                 history,
                 true,
+                false,
             )
         } else {
+            // The zero-window probe is a fail-high expectation, so its child is
+            // a cut node (`sf_19/search.cpp:1417`, `!cutNode` at the root).
             let s = -alphabeta::alphabeta(
                 &child,
                 -alpha - 1,
@@ -229,6 +265,7 @@ fn root_search_depth(
                 shared,
                 thread,
                 history,
+                true,
                 true,
             );
             if s > alpha && s < beta0 {
@@ -242,6 +279,7 @@ fn root_search_depth(
                     thread,
                     history,
                     true,
+                    false,
                 )
             } else {
                 s

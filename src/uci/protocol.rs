@@ -31,6 +31,7 @@ use crate::config::{EngineConfig, EvalMode};
 use crate::endgame::{LoadReport, Syzygy};
 use crate::evaluation::Evaluator;
 use crate::nnue::network::Network;
+use crate::search::params::SearchParams;
 use crate::search::{SearchResult, Searcher};
 use crate::types::{RawMove, is_mate, mate_plies};
 use crate::uci::parser::{Command, GoParams};
@@ -82,6 +83,7 @@ impl UciEngine {
         let mut config = EngineConfig::default();
         let books = load_books(&config);
         let params = load_params(&config);
+        let sp = load_search_params(&config);
         // Syzygy: load whatever the configured path holds (an empty path
         // keeps the tablebase inert). Warnings + the loaded-file summary go
         // to stderr — never into the UCI stdout stream.
@@ -93,6 +95,7 @@ impl UciEngine {
         // happens once here and never per search.
         let nnue = load_nnue(&mut config);
         let mut searcher = Searcher::with_params(crate::config::DEFAULT_HASH_MB, params);
+        searcher.set_search_params(sp);
         searcher.set_syzygy(syzygy);
         searcher.set_nnue(nnue);
         UciEngine {
@@ -223,6 +226,25 @@ impl UciEngine {
                 let params = load_params(&self.config);
                 if let Some(s) = &mut self.searcher {
                     s.params = Arc::new(params);
+                }
+            }
+            "SearchParamsPath" | _ if name.starts_with("SearchGate.") => {
+                // Search parameters and feature gates. Applied through the same
+                // path so a mid-game change is visible to the very next search.
+                // The table is *not* flushed: a bound stored under the old
+                // parameters is still a bound, and forcing a wipe on every
+                // `setoption` would make a tuning run incomparable.
+                let sp = load_search_params(&self.config);
+                if let Some(s) = &mut self.searcher {
+                    s.set_search_params(sp);
+                }
+                if self.config.debug {
+                    eprintln!(
+                        "info string search params fingerprint {}",
+                        self.searcher
+                            .as_ref()
+                            .map_or_else(String::new, |s| s.search_params_fingerprint())
+                    );
                 }
             }
             "Eval" => {
@@ -636,6 +658,45 @@ fn write_syzygy_report(report: &LoadReport) {
             report.files, report.max_pieces, report.path
         );
     }
+}
+
+/// Loads the *search* parameters and feature gates for an engine
+/// configuration.
+///
+/// Mirrors [`load_params`] exactly in contract: an empty
+/// `SearchParamsPath` yields the built-in Stockfish-19-faithful defaults, and a
+/// configured but unreadable or malformed file falls back to those defaults
+/// with a stderr note. Never fatal — a tuning file that a GUI left pointing at
+/// a deleted path must not stop the engine from playing.
+///
+/// The gates live in [`EngineConfig::gates`] rather than in the file, so a
+/// `setoption SearchGate.<name>=false` survives a later reload of the file:
+/// the file supplies the *numbers*, the config supplies the *switches*. That
+/// split is what makes an A/B run a one-line change on top of one shared
+/// parameter file.
+fn load_search_params(config: &EngineConfig) -> SearchParams {
+    let mut sp = if config.search_params_path.is_empty() {
+        SearchParams::default()
+    } else {
+        match SearchParams::load(&config.search_params_path) {
+            Ok(p) => {
+                eprintln!(
+                    "info string loaded search params from {}",
+                    config.search_params_path
+                );
+                p
+            }
+            Err(e) => {
+                eprintln!(
+                    "info string search params {}: {e:#} — using built-in defaults",
+                    config.search_params_path
+                );
+                SearchParams::default()
+            }
+        }
+    };
+    sp.gates = config.gates;
+    sp
 }
 
 /// Loads the evaluation parameters for an engine configuration. An empty

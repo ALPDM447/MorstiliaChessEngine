@@ -8,8 +8,8 @@
 //! The implementation follows the classic "swap list" algorithm: attackers of
 //! both colors are maintained and iteratively resolved with the least
 //! valuable attacker, re-adding x-ray sliders as pieces vacate the line.
-//! The moving piece is removed from the occupancy before the scan so it is
-//! not double-counted.
+//! Occupancy is masked into the attacker set after every refresh so pieces
+//! that have already moved cannot reappear from their original squares.
 
 use shakmaty::{Bitboard, Board, Color, Role, Square};
 
@@ -28,9 +28,8 @@ use crate::types::RawMove;
 ///   on the square (the mover's own piece for the first response).
 /// * The first responder is the *opponent* (`stm = !us`); `stm` flips after
 ///   every simulated capture.
-/// * A retrograde minimax walks the list backwards — a side only continues
-///   the exchange if it is profitable — and the last speculative entry is
-///   discarded; `swap[0]` is the result, positive for the mover.
+/// * A retrograde minimax walks the list backwards — a side only continues the
+///   exchange if it is profitable.
 ///
 /// Material values are read from the tunable `p` so SEE stays consistent with
 /// the evaluation ('p' is the searcher's shared parameter set).
@@ -41,29 +40,40 @@ pub fn see(board: &Board, m: RawMove, p: &EvalParams) -> i32 {
     let Some(piece) = board.piece_at(from) else {
         return 0;
     };
+
     let moving = piece.role;
+    let us = piece.color;
+    let promo = m.promotion();
+
     if moving == Role::King {
         return 0; // king captures are quiet by convention here
     }
-    let us = piece.color;
+
+    // SEE is only meaningful for captures and promotions.
+    let is_capture = m.is_en_passant() || board.role_at(to).is_some();
+    if !is_capture && promo.is_none() {
+        return 0;
+    }
 
     // Occupancy used for the x-ray scans: the mover leaves its origin and the
     // captured victim leaves its square, so sliders see through afterwards.
     let mut occ = board.occupied();
     occ ^= Bitboard::from_square(from);
+
     if m.is_en_passant() {
         let ep = if us == Color::White {
             to.offset(-8)
         } else {
             to.offset(8)
         };
+
         occ ^= Bitboard::from_square(ep.unwrap_or(to));
     } else if board.role_at(to).is_some() {
         occ ^= Bitboard::from_square(to);
     }
 
-    let promo = m.promotion();
     let pawn_value = p.piece_value(Role::Pawn);
+
     let victim = if m.is_en_passant() {
         pawn_value
     } else {
@@ -81,42 +91,57 @@ pub fn see(board: &Board, m: RawMove, p: &EvalParams) -> i32 {
     // mover just placed on `to` (its promoted form, if any).
     let mut occupant = promo.map_or(p.piece_value(moving), |r| p.piece_value(r));
 
-    let mut attackers = attacks_to(board, to, occ);
-    // The mover itself cannot act as a recapturer.
-    attackers &= !Bitboard::from_square(from);
+    // IMPORTANT:
+    //
+    // Board::attacks_to() uses the board's piece placement together with the
+    // supplied occupancy for sliding attacks. Because SEE is simulating moves
+    // without mutating the real Board, a piece that has already moved can
+    // otherwise still appear in the attacker set from its original square.
+    //
+    // Masking with `occ` removes every piece that is no longer physically
+    // present in the simulated position.
+    let mut attackers = attacks_to(board, to, occ) & occ;
 
     let mut idx = 1usize;
-    let mut stm = !us; // the opponent moves first after the initial capture
+    let mut stm = !us;
 
     while idx < swap.len() {
+        // Keep the attacker set synchronized with the simulated occupancy.
+        attackers &= occ;
+
         let Some((sq, role)) = least_valuable_attacker(board, attackers, stm) else {
             break;
         };
-        if role == Role::King {
-            // The opponent only has their king left; it is never actually
-            // captured, so the exchange stops here.
-            break;
-        }
-        occ ^= Bitboard::from_square(sq);
-        // X-ray sliders may appear behind the vacated square.
-        attackers = (attackers & !Bitboard::from_square(sq)) | attacks_to(board, to, occ);
+
+        let sq_bb = Bitboard::from_square(sq);
+
+        // The attacker leaves its current square.
+        occ ^= sq_bb;
+
+        // X-ray sliders may now appear behind the vacated square.
+        //
+        // Mask with occ again so a piece which already moved cannot be
+        // resurrected from its original Board square.
+        attackers = (attackers & !sq_bb) | (attacks_to(board, to, occ) & occ);
 
         swap[idx] = occupant - swap[idx - 1];
         occupant = p.piece_value(role);
+
         idx += 1;
         stm = !stm;
     }
 
-    // Retrograde minimax over the swap list; the last speculative entry (the
-    // unanswerable capture) is never consulted.
+    // Retrograde minimax over the swap list.
     while idx > 1 {
         idx -= 1;
         swap[idx - 1] = -(-swap[idx - 1]).max(swap[idx]);
     }
+
     swap[0]
 }
 
 /// Attackers of both colors on `to` given occupancy `occ` (includes x-rays).
+#[inline]
 fn attacks_to(board: &Board, to: Square, occ: Bitboard) -> Bitboard {
     board.attacks_to(to, Color::White, occ) | board.attacks_to(to, Color::Black, occ)
 }
@@ -137,21 +162,15 @@ fn least_valuable_attacker(
         Role::King,
     ] {
         let candidates = attackers & board.by_piece(role.of(stm));
+
         if let Some(sq) = candidates.first() {
-            // Pawns: only forward diagonals can actually capture `to`; the
-            // attacker set already encodes that via attacks_to, so nothing
-            // extra to filter here.
+            // The attacker set already contains only pieces whose movement
+            // pattern reaches `to` under the current simulated occupancy.
             return Some((sq, role));
         }
     }
-    None
-}
 
-/// Convenience wrapper: is this capture winning enough to be worth searching
-/// in quiescence (`see >= threshold` relative to position value)?
-#[inline]
-pub fn see_ge(board: &Board, m: RawMove, threshold: i32, p: &EvalParams) -> bool {
-    see(board, m, p) >= threshold
+    None
 }
 
 #[cfg(test)]

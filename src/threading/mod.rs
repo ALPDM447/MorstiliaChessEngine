@@ -272,6 +272,7 @@ pub fn run_search(
         shared: SearchShared {
             tt: shared.tt.clone(),
             params: shared.params.clone(),
+            sp: shared.sp.clone(),
             stop: shared.stop.clone(),
             nodes: shared.nodes.clone(),
             node_cap: shared.node_cap,
@@ -617,6 +618,7 @@ mod tests {
         let shared = SearchShared {
             tt: Arc::new(crate::tt::TranspositionTable::new(4)),
             params: Arc::new(crate::evaluation::EvalParams::default()),
+            sp: Arc::new(crate::search::params::SearchParams::default()),
             stop: Arc::new(AtomicBool::new(false)),
             nodes: Arc::new(AtomicU64::new(0)),
             node_cap: None,

@@ -18,10 +18,13 @@
 //! function of the traversal.
 
 pub mod alphabeta;
+pub mod correction;
 pub mod iterative;
+pub mod params;
 pub mod pruning;
 pub mod qsearch;
 pub mod reductions;
+pub mod singular;
 pub mod stats;
 pub mod time;
 
@@ -37,16 +40,46 @@ use crate::endgame::{Syzygy, TbOutcome, wdl_score};
 use crate::evaluation::{EvalParams, Evaluator};
 use crate::move_ordering::OrderingTables;
 use crate::move_ordering::history::MoveCtx;
+use crate::move_ordering::is_capture_or_promotion;
 use crate::nnue::accumulator::AccumulatorStack;
 use crate::nnue::features::half_ka_v2_hm;
 use crate::nnue::network::Network;
 use crate::nnue::types::Color as NnueColor;
 use crate::nnue::{self, board::Board as NnueBoard};
+use crate::search::params::SearchParams;
 use crate::tt::TranspositionTable;
-use crate::types::{Depth, MATE, MAX_PLY, RawMove};
+use crate::types::{Depth, INFINITE, MATE, MAX_PLY, RawMove};
 
 pub use stats::SearchStats;
 pub use time::TimeLimit;
+
+/// What the parent knew about the move that entered a given ply.
+///
+/// Recorded by the parent immediately before it recurses, because the child
+/// cannot recover either fact on its own: the child knows whether *it* is in
+/// check, not whether its parent was, and it has no board on which to classify
+/// the move it arrived by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnteredPly {
+    /// The parent's own node was in check — the move was a forced reply and
+    /// says little about how good it is.
+    pub parent_in_check: bool,
+    /// The entering move was a capture or a promotion.
+    pub capture: bool,
+    /// A real move entered this ply. A null move and a root both do not, which
+    /// is what `sf_19`'s `((ss - 1)->currentMove).is_ok()` tests.
+    pub real_move: bool,
+}
+
+impl EnteredPly {
+    /// The all-false, no-move state. Also what the root and a null-move child
+    /// get, because neither is the result of a real move being played.
+    pub const NONE: EnteredPly = EnteredPly {
+        parent_in_check: false,
+        capture: false,
+        real_move: false,
+    };
+}
 
 /// Scores at least this far from `MATE` are treated as real scores (not mate
 /// scores); used to re-base mate scores through the transposition table.
@@ -110,6 +143,77 @@ pub struct SearchThread {
     /// Per-ply move contexts (the move that entered ply `k`), used for
     /// countermove and continuation-history lookups.
     pub ctx: [Option<MoveCtx>; MAX_PLY],
+    /// The move excluded from the current ply's search by a singular-extension
+    /// verification search. `None` means no move is excluded.
+    pub excluded_move: [Option<RawMove>; MAX_PLY],
+    /// Stockfish's `ss->followPV`: is this node on the principal variation of
+    /// the *previous* iteration?
+    ///
+    /// This is a distinct piece of state from the node's own `pv_node`, and
+    /// conflating the two silently changes which branches are reachable (the
+    /// quiet-move pruning gate is `!followPV || !PvNode`, a genuine
+    /// two-variable condition). Refreshed once per iteration by
+    /// [`SearchThread::set_previous_pv`] and once per node by
+    /// [`SearchThread::set_follow_pv`].
+    pub follow_pv: [bool; MAX_PLY],
+    /// The PV the last completed iteration produced.
+    ///
+    /// Stockfish's `lastIterationIdxPV`; the `followPV` recurrence compares the
+    /// move that entered a ply against this.
+    pub prev_pv: [RawMove; MAX_PLY],
+    /// Length of [`SearchThread::prev_pv`]. `0` on the first iteration, which
+    /// makes every non-root `follow_pv` false — the correct answer, since there
+    /// is no previous line to follow yet.
+    pub prev_pv_len: usize,
+    /// The current iteration's root depth. Stockfish's `rootDepth`, needed by the
+    /// singular extension margins' `-(ss->ply > rootDepth) * 38 / 43` terms.
+    pub root_depth: Depth,
+    /// The width of the window the root was last searched with — Stockfish's
+    /// `rootDelta`, the divisor in the modern reduction formula.
+    ///
+    /// Stockfish leaves it uninitialised until its aspiration loop first runs
+    /// (`search.cpp:394`); Morstilia seeds it with
+    /// [`SearchParams::lmr_root_delta_default`] and refreshes it before every
+    /// root search, so the division is always defined.
+    pub root_delta: i32,
+    /// The `ttMoveHistory` statistic (`sf_19/src/history.h:196`).
+    ///
+    /// A single damped scalar per worker, **not** a table: how often the node's
+    /// TT move has turned out to be the move that actually caused the cutoff.
+    /// Positive means the table's move ordering is trustworthy here; the
+    /// singular extension margins use it to decide how deep to extend, and the
+    /// multi-cut return path penalises it.
+    pub tt_move_history: i32,
+    /// The reduction the parent applied before entering this ply
+    /// (`ss->reduction`), read by the LMR hindsight depth adjustment.
+    pub prior_reduction: [Depth; MAX_PLY],
+    /// Stockfish's file-static `nmpMinPly`: while a high-depth null-move
+    /// verification search is running, null moves are suppressed at plies
+    /// below this. Zero outside such a search (the common case), so the
+    /// null-move gate `ss->ply >= nmpMinPly` is a no-op everywhere else.
+    pub nmp_min_ply: i32,
+    /// The score the previous iteration of the root search produced, i.e.
+    /// `rootMoves[pvIdx].score` at the start of the current iteration. Drives
+    /// `seekMate = rootDepth >= 16 && |rootScore| >= 2000`, which gates the
+    /// child reverse-futility depth bound. `-INFINITE` before the first
+    /// iteration, which is the correct "we have no mate in sight" answer.
+    pub root_score: i32,
+    /// How many beta cutoffs this node's first child already produced
+    /// (`(ss + 1)->cutoffCnt`), read by the modern reduction formula.
+    pub cutoff_count: [i32; MAX_PLY],
+    /// Facts about the move that *entered* each ply, recorded by the parent
+    /// before it recurses. Both are read by the Stockfish 19 evaluation-difference
+    /// history bonus (`search.cpp:978-986`), which needs to know whether the
+    /// parent's own node was in check and whether the move into it was a
+    /// capture — neither of which is recoverable at the child.
+    pub entered: [EnteredPly; MAX_PLY],
+    /// Learned static-evaluation corrections (`src/search/correction.rs`).
+    ///
+    /// Per thread, like every other learned table: one instance per worker
+    /// keeps `Threads = 1` fully deterministic and parallel helpers free of
+    /// contention. Cleared by [`SearchThread::begin`] so no evidence leaks
+    /// between searches.
+    pub corrections: crate::search::correction::CorrectionHistory,
     /// Per-ply NNUE accumulator stack, one slot per search ply.
     ///
     /// Heap-allocated on the *first* NNUE node and `None` in classical mode,
@@ -133,6 +237,19 @@ impl SearchThread {
             hashes: [Zobrist64::default(); MAX_PLY],
             evals: [0; MAX_PLY],
             ctx: [None; MAX_PLY],
+            excluded_move: [None; MAX_PLY],
+            follow_pv: [false; MAX_PLY],
+            prev_pv: [RawMove::NULL; MAX_PLY],
+            prev_pv_len: 0,
+            root_depth: 0,
+            root_delta: crate::search::params::SearchParams::default().lmr_root_delta_default,
+            tt_move_history: 0,
+            nmp_min_ply: 0,
+            root_score: -INFINITE,
+            prior_reduction: [0; MAX_PLY],
+            cutoff_count: [0; MAX_PLY],
+            entered: [EnteredPly::NONE; MAX_PLY],
+            corrections: crate::search::correction::CorrectionHistory::new(),
             accums: None,
         }
     }
@@ -152,6 +269,99 @@ impl SearchThread {
         if let Some(stack) = self.accums.as_mut() {
             stack.reset();
         }
+        // Correction history is per-search evidence, not per-engine knowledge:
+        // carrying it across searches would make a later search depend on the
+        // order in which earlier positions happened to be visited, and would
+        // break the determinism a `Threads = 1` run must have.
+        self.corrections.clear();
+        // Excluded move is per-search state; clear it to avoid stale exclusions.
+        self.excluded_move.fill(None);
+        // `followPV` is defined against the *previous* iteration's line, so a
+        // new search has none: every non-root node starts off the PV.
+        self.follow_pv.fill(false);
+        self.prev_pv.fill(RawMove::NULL);
+        self.prev_pv_len = 0;
+        self.root_depth = 0;
+        // `ttMoveHistory` is per-search evidence, exactly like the correction
+        // history: it summarises what happened *in this search* and carrying it
+        // over would make a later search depend on the order in which earlier
+        // positions happened to be visited.
+        self.tt_move_history = 0;
+        self.prior_reduction.fill(0);
+        self.cutoff_count.fill(0);
+        self.entered.fill(EnteredPly::NONE);
+        // `nmpMinPly` is zero outside a high-depth null-move verification
+        // search, and it must start at zero for every search so a
+        // verification running in one search cannot leak its floor into the
+        // next.
+        self.nmp_min_ply = 0;
+        // `rootScore` is `-INFINITE` before the first iteration, which is the
+        // correct "no mate in sight" answer for the `seekMate` gate.
+        self.root_score = -INFINITE;
+    }
+
+    /// Records the principal variation the previous iteration produced, which is
+    /// what the `followPV` recurrence compares against.
+    ///
+    /// Called by the iterative-deepening driver once per completed iteration,
+    /// before the next iteration's root search. Truncation to [`MAX_PLY`] is
+    /// deliberate: a longer line cannot be reached at a legal ply anyway.
+    pub fn set_previous_pv(&mut self, pv: &[RawMove]) {
+        let n = pv.len().min(MAX_PLY);
+        self.prev_pv[..n].copy_from_slice(&pv[..n]);
+        self.prev_pv[n..].fill(RawMove::NULL);
+        self.prev_pv_len = n;
+    }
+
+    /// Refreshes `follow_pv[ply]` and returns it.
+    ///
+    /// Stockfish's recurrence (`search.cpp:772-776`):
+    ///
+    /// ```text
+    /// ss->followPV = rootNode
+    ///             || ((ss - 1)->followPV
+    ///                 && ss->ply - 1 < lastIterationIdxPV.size()
+    ///                 && (ss - 1)->currentMove == lastIterationIdxPV[ss->ply - 1]);
+    /// ```
+    ///
+    /// Morstilia keeps the move that entered a ply in `ctx[ply - 1]`, which is
+    /// the same quantity as `(ss - 1)->currentMove`. The comparison is on
+    /// `from`/`to` only, because a [`MoveCtx`] does not store the promotion
+    /// kind: a previous-iteration knight promotion and a queen promotion of the
+    /// same piece to the same square compare equal. That is a strictly narrow
+    /// over-approximation — it can make `followPV` true in one case where
+    /// Stockfish would say false — and it is the conservative direction, since
+    /// the only consumer that treats `followPV` as "trust this line" is IIR,
+    /// where a false positive merely forgoes a reduction.
+    #[inline]
+    pub fn set_follow_pv(&mut self, ply: usize, root_node: bool) -> bool {
+        let on = root_node
+            || (ply > 0
+                && self.follow_pv[ply - 1]
+                && ply <= self.prev_pv_len
+                && match self.ctx[ply - 1] {
+                    Some(c) => {
+                        let want = self.prev_pv[ply - 1];
+                        c.from == want.from() && c.to == want.to()
+                    }
+                    None => false,
+                });
+        self.follow_pv[ply] = on;
+        on
+    }
+
+    /// Applies a damped, saturating shift to the `ttMoveHistory` statistic.
+    ///
+    /// This is Stockfish's `StatsEntry::operator<<`
+    /// (`sf_19/src/history.h:69-78`) on a single cell:
+    /// `val = val + bonus - val * |bonus| / limit`, with `bonus` clamped to
+    /// `±limit`. The damping term is what makes the statistic converge to
+    /// `±limit` rather than growing without bound, and it guarantees the value
+    /// can never leave the open interval.
+    #[inline]
+    pub fn shift_tt_move_history(&mut self, bonus: i32, limit: i32) {
+        self.tt_move_history =
+            crate::search::singular::tt_move_history_shift(self.tt_move_history, bonus, limit);
     }
 
     // --- NNUE accumulator plumbing -----------------------------------------
@@ -175,32 +385,81 @@ impl SearchThread {
         self.accums.as_deref().map(|s| s.get(ply))
     }
 
-    /// Scores `pos` with whichever evaluator this search is configured for.
+    /// Scores `pos` with whichever evaluator this search is configured for, and
+    /// adds the learned correction — **unless the side to move is in check**.
     ///
     /// In classical mode this is exactly [`Evaluator::evaluate_with`] and the
     /// NNUE stack is never touched. In NNUE mode it reads slot `ply`, which
     /// must already describe `pos`.
+    ///
+    /// The check test is not an optimisation. Stockfish calls
+    /// `to_corrected_static_eval` from exactly one place — the "static
+    /// evaluation of the position" step — and a check node never reaches it:
+    /// `if (ss->inCheck) ss->staticEval = eval = (ss - 2)->staticEval;`. A check
+    /// node has no evaluation of its own to correct, and the value it inherits
+    /// is deliberately uncorrected, so reading a cell here would learn from a
+    /// number the feature is not allowed to touch.
     #[inline]
-    pub fn evaluate_at(&mut self, pos: &Position, shared: &SearchShared, ply: usize) -> i32 {
+    pub fn evaluate_at(
+        &mut self,
+        pos: &Position,
+        shared: &SearchShared,
+        ply: usize,
+        in_check: bool,
+    ) -> i32 {
+        let raw = self.raw_evaluate_at(pos, shared, ply);
+        if in_check {
+            // Inherited static evaluations still go through the clamp: that is
+            // an engine-wide invariant on every static evaluation, not part of
+            // the correction.
+            return correction::clamp_non_mate(raw);
+        }
+        correction::correct(raw, self.correction_at(pos, ply))
+    }
+
+    /// The **uncorrected** static evaluation: exactly what the configured
+    /// evaluator says, with no learned correction applied.
+    ///
+    /// Callers that need the evaluator's own opinion rather than the search's
+    /// use this. The transposition table stores searched scores, never a static
+    /// evaluation, so there is no field in it that a learned correction could be
+    /// baked into — but the search's own pruning decisions are the other place a
+    /// corrected value would persist, which is exactly why only the number used
+    /// for pruning is corrected and the number derived from it is not.
+    #[inline]
+    pub fn raw_evaluate_at(&mut self, pos: &Position, shared: &SearchShared, ply: usize) -> i32 {
         let Some(net) = shared.nnue.as_deref() else {
             return Evaluator.evaluate_with(pos, &shared.params);
         };
-        // Self-heal: a slot that was never written for this search.
-        let uncomputed = {
-            let stack = self.accums_mut();
-            let acc = stack.get(ply);
-            !acc.computed[0] || !acc.computed[1]
-        };
-        if uncomputed {
+        // Self-heal: a slot that was never written for this search. The check
+        // and the repair share one borrow of the stack — the old form walked
+        // `self.accums` three times (once to test, once to repair, once to
+        // read) on a line that runs for *every* node of the search.
+        let stack = self.accums_mut();
+        let acc = stack.get_mut(ply);
+        if !acc.computed[0] || !acc.computed[1] {
             let board = NnueBoard::from_position(pos);
-            let stack = self.accums_mut();
-            let acc = stack.get_mut(ply);
             for p in NnueColor::ALL {
                 acc.refresh(p, &board, net);
             }
         }
-        let acc = self.accums.as_deref().expect("just allocated").get(ply);
+        // Reborrow immutably: the mutable borrow above is finished with.
+        let acc = stack.get(ply);
         nnue::evaluate(net, pos, acc)
+    }
+
+    /// The learned correction for the node at `ply`, in its own raw (scaled)
+    /// form.
+    ///
+    /// The three contexts come off the thread's move stack, so the continuation
+    /// families are addressed the way Stockfish addresses them. Near the root the
+    /// slots are `None` by construction, which makes the correction fall back to
+    /// the material families — and, on the node with no incoming move at all, to
+    /// Stockfish's [`correction::NO_INCOMING`] constant.
+    #[inline]
+    pub fn correction_at(&self, pos: &Position, ply: usize) -> i32 {
+        self.corrections
+            .correction(pos, correction::CorrectionCtx::from_stack(&self.ctx, ply))
     }
 
     /// Builds the child position and keeps the accumulator stack in step.
@@ -225,12 +484,14 @@ impl SearchThread {
         let us = NnueColor::from_shakmaty(pos.turn());
         let board = NnueBoard::from_position(pos);
         let d = board.apply_move(m, us);
-        let parent_computed = self
-            .accums
-            .as_deref()
-            .is_some_and(|s| s.get(ply - 1).computed[0] && s.get(ply - 1).computed[1]);
+        // One borrow of the stack, not two: the parent's `computed` flags and
+        // the child's slot are read through the same `parent_and_child_mut`
+        // split, so a second `self.accums` walk (an `Option` test plus two
+        // slice lookups) is pure overhead on a path that runs once per move
+        // made — the single hottest line in the search.
         let stack = self.accums_mut();
         let (parent, acc) = stack.parent_and_child_mut(ply - 1, ply);
+        let parent_computed = parent.computed[0] && parent.computed[1];
         for p in NnueColor::ALL {
             if !parent_computed || half_ka_v2_hm::requires_refresh(&d.dirty_piece, p) {
                 acc.refresh(p, &d.board, net);
@@ -249,20 +510,23 @@ impl SearchThread {
         child
     }
 
-    /// The null-move counterpart of [`SearchThread::make_child`].
+    /// The null-move counterpart of [`SearchThread::make_child`], taking the
+    /// already-constructed child position.
     ///
-    /// Passing changes nothing on the board, so the child slot is a byte-for-byte
-    /// copy of the parent's.
+    /// [`Position::null_move`] is not a cheap board edit: it converts the whole
+    /// position to a `Setup`, rebuilds a `Chess` from it and recomputes the
+    /// Zobrist hash from scratch. The caller has to ask whether the pass is
+    /// legal *anyway* (it is part of the null-move guard chain), so the answer
+    /// is a value, not a predicate — building it twice, once as a guard and
+    /// once here, doubled the most expensive step of the entire null-move path.
+    /// The position is therefore built once and handed in.
     #[inline]
     pub fn make_child_null(
         &mut self,
-        pos: &Position,
+        child: Position,
         shared: &SearchShared,
         ply: usize,
     ) -> Position {
-        let child = pos
-            .null_move()
-            .expect("null_move is Some when this is called");
         let Some(_net) = shared.nnue.as_deref() else {
             return child;
         };
@@ -351,6 +615,50 @@ impl SearchThread {
             .copy_from_slice(&child_line[ply + 1..ply + 1 + child_len]);
         self.pv_len[ply] = child_len + 1;
     }
+
+    /// Tests whether `m` is a "shuffling" move — a move that merely reverses
+    /// the move played two plies ago, which in turn reversed the move four
+    /// plies ago. This mirrors Stockfish's `is_shuffling` and is used to
+    /// suppress singular extensions in positions where pieces are simply
+    /// oscillating (a common cause of false singular candidates).
+    ///
+    /// The check requires:
+    /// * `m` is not a capture,
+    /// * the 50-move counter is at least 10,
+    /// * we are at least 20 plies deep (a proxy for SF's `pliesFromNull >= 6`,
+    ///   since Morstilia does not track plies since the last null move),
+    /// * the move two plies ago went from `m.to` to `m.from`,
+    /// * the move four plies ago went from `m.from` to `m.to`.
+    #[inline]
+    pub fn is_shuffling(&self, pos: &Position, m: RawMove, ply: usize) -> bool {
+        // Captures are never shuffling.
+        if is_capture_or_promotion(pos.board(), m) {
+            return false;
+        }
+        // Too early in the game / 50-move clock.
+        if pos.halfmoves() < 10 {
+            return false;
+        }
+        // Not deep enough in the tree (SF also checks pliesFromNull >= 6).
+        if ply < 20 {
+            return false;
+        }
+        // Need the move two and four plies ago.
+        let two_ago = match self.ctx.get(ply.saturating_sub(1)) {
+            Some(Some(ctx)) => ctx,
+            _ => return false,
+        };
+        let four_ago = match self.ctx.get(ply.saturating_sub(3)) {
+            Some(Some(ctx)) => ctx,
+            _ => return false,
+        };
+        // Check the A->B, B->A pattern: move two ago went to -> from,
+        // move four ago went from -> to.
+        two_ago.to == m.to()
+            && two_ago.from == m.from()
+            && four_ago.to == m.from()
+            && four_ago.from == m.to()
+    }
 }
 
 impl Default for SearchThread {
@@ -371,6 +679,16 @@ pub struct SearchShared {
     /// decision in this search (static eval, SEE, MVV-LVA, history tiers).
     /// One fixed set per search, so `Threads = 1` stays deterministic.
     pub params: Arc<EvalParams>,
+    /// The search parameters: singular extensions, multi-cut, negative
+    /// extensions, internal iterative reductions, the modern late-move
+    /// reduction formula and the pruning thresholds.
+    ///
+    /// One fixed set per search for the same reason as [`SearchShared::params`]:
+    /// every worker must read the *same* numbers, or a Lazy SMP search stops
+    /// being reproducible. Immutable while the search runs — changing a
+    /// parameter means starting a new search — so it is shared behind an `Arc`
+    /// with no locking on the read path.
+    pub sp: Arc<SearchParams>,
     /// The (per-`go`) stop signal; an external `stop` command flips it and
     /// every worker aborts on its next 1024-node sampling.
     pub stop: Arc<AtomicBool>,
@@ -536,6 +854,17 @@ pub struct Searcher {
     /// the baseline `EvalParams::default()`; `Searcher::with_params` injects
     /// a tuned set.
     pub params: Arc<EvalParams>,
+    /// The search parameters used by all searches from this searcher: singular
+    /// extensions, multi-cut, negative extensions, internal iterative
+    /// reductions, the modern late-move-reduction formula and the pruning
+    /// thresholds.
+    ///
+    /// Kept separate from [`Searcher::params`] on purpose: the evaluation
+    /// parameters are *frozen* (the classical baseline is a correctness
+    /// contract for the ground-truth tests), while these are the knobs the
+    /// tuner sweeps. Splitting them means a tuning run can never perturb the
+    /// evaluator, and a match report can fingerprint the two independently.
+    pub sp: Arc<SearchParams>,
     /// The configured Syzygy tables, shared into every search (and, through
     /// `SearchShared`, every worker). Defaults to an inert [`Syzygy::none`].
     pub tb: Arc<Syzygy>,
@@ -563,10 +892,27 @@ impl Searcher {
         Searcher {
             tt: Arc::new(TranspositionTable::new(hash_mb)),
             params: Arc::new(params),
+            sp: Arc::new(SearchParams::default()),
             tb: Arc::new(Syzygy::none()),
             nnue: None,
             pool: crate::threading::LazySmpPool::new(),
         }
+    }
+
+    /// Replaces the search parameters for every subsequent search.
+    ///
+    /// Takes effect on the next `search` call: a running search keeps the `Arc`
+    /// it started with, so a parameter can never change under a worker
+    /// mid-search. This is the seam the UCI `setoption name SearchParamsPath`
+    /// and the tuning binaries use.
+    pub fn set_search_params(&mut self, sp: SearchParams) {
+        self.sp = Arc::new(sp);
+    }
+
+    /// A fingerprint of the active search parameters, for match reports and
+    /// configuration dumps. Two engines may only be compared when these match.
+    pub fn search_params_fingerprint(&self) -> String {
+        self.sp.fingerprint()
     }
 
     /// Installs (or, with `None`, removes) the NNUE net.
@@ -648,6 +994,7 @@ impl Searcher {
         let shared = SearchShared {
             tt: self.tt.clone(),
             params: self.params.clone(),
+            sp: self.sp.clone(),
             stop: stop.clone(),
             nodes: Arc::new(AtomicU64::new(0)),
             node_cap: limits.nodes,

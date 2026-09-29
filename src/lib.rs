@@ -40,6 +40,7 @@ pub mod regression;
 pub mod search;
 pub mod selfplay;
 pub mod threading;
+pub mod training;
 pub mod tt;
 pub mod tuning;
 pub mod types;

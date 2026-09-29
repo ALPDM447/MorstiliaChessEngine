@@ -7,7 +7,11 @@
 //! 2. captures & promotions, ordered by MVV-LVA ([`tt_move::capture_score`]),
 //! 3. killer moves for the current ply,
 //! 4. quiet moves, scored from the history tables ([`History`]; countermove
-//!    and continuation bonuses included).
+//!    and continuation bonuses included),
+//! 5. *losing* captures — captures whose static exchange evaluation is
+//!    negative. Stockfish searches these last (`sf_19/src/move.cpp`: the
+//!    `BAD_CAPTURE` stage follows `QUIET`), because a capture that gives back
+//!    more than it takes is refuted far more often than any quiet move.
 //!
 //! All ordering state lives in [`OrderingTables`], owned by the search — the
 //! engine keeps no global mutable state, and a `Threads = 1` search is
@@ -22,7 +26,7 @@ use shakmaty::Role;
 
 use crate::board::Position;
 use crate::evaluation::params::EvalParams;
-use crate::types::{MoveList, RawMove};
+use crate::types::{MAX_MOVES, MoveList, RawMove};
 
 pub use history::{History, MoveCtx};
 pub use killers::Killers;
@@ -53,14 +57,6 @@ impl OrderingTables {
     pub fn reset(&mut self) {
         self.killers.reset();
         self.history.clear();
-    }
-
-    /// Clears killers + countermoves but keeps accumulated quiet-move history
-    /// (used when starting a new search on a fresh position where short-term
-    /// tables from the previous game would mislead).
-    pub fn new_position(&mut self) {
-        self.killers.reset();
-        self.history.clear_counter();
     }
 }
 
@@ -134,6 +130,25 @@ pub fn order_moves(
 
 /// [`order_moves`] with full search context: killer lookup at `ply` and the
 /// previous two move contexts for continuation history.
+///
+/// Keys are computed **once per move** into a stack array, which is then sorted
+/// with the key carried alongside the move, and finally copied back. Calling
+/// [`score_move`] from inside a comparator — which is what a plain
+/// `sort_unstable_by_key(|m| -score_move(m))` does — evaluates the key
+/// `O(n log n)` times, and one evaluation is several random reads into the
+/// history tables. The resulting permutation is unchanged up to the
+/// tie-breaking of an unstable sort, which was never load-bearing: two moves
+/// with identical ordering scores are interchangeable to the search.
+///
+/// The `BAD_CAPTURE` split is Stockfish's `sf_19/src/move.cpp` stage order: a
+/// capture whose static exchange evaluation is negative is searched *after* every
+/// quiet move, not merely lower within the capture tier. A capture that gives
+/// back more than it takes is refuted more often than any quiet move, and both
+/// the per-move SEE pruning and the singular/multi-cut machinery want a correct
+/// capture in front of them.
+///
+/// `BAD_CAPTURE_TIER` sits below every quiet score, so the split needs no second
+/// sort pass: the demotion is expressed purely as a lower key.
 #[allow(clippy::too_many_arguments)]
 pub fn order_moves_ctx(
     moves: &mut MoveList,
@@ -145,9 +160,32 @@ pub fn order_moves_ctx(
     ant: Option<MoveCtx>,
     p: &EvalParams,
 ) {
-    moves
-        .as_mut_slice()
-        .sort_unstable_by_key(|&m| -score_move(pos, m, tt_move, tables, ply, prev, ant, p));
+    let board = pos.board();
+    // `(negated key, move)` so an ascending sort yields a descending key order,
+    // matching the previous `-score_move(m)` comparator exactly.
+    let mut keyed: [(i32, u16, RawMove); MAX_MOVES] = [(0, 0, RawMove::NULL); MAX_MOVES];
+    let n = moves.len().min(MAX_MOVES);
+    for (i, slot) in keyed.iter_mut().enumerate().take(n) {
+        let m = moves.get(i);
+        let mut key = score_move(pos, m, tt_move, tables, ply, prev, ant, p);
+        if key >= tt_move::CAPTURE_TIER && key < tt_move::KILLER2_TIER && see::see(board, m, p) < 0
+        {
+            key = tt_move::BAD_CAPTURE_TIER + capture_score(board, m, p);
+        }
+        // The second field is the move's index, so the sort stays *stable* in
+        // the original order for equal keys without needing `RawMove: Ord`.
+        // That is strictly more deterministic than the previous unstable
+        // comparator, which could permute equal-keyed moves arbitrarily.
+        *slot = (-key, i as u16, m);
+    }
+    // Sorting compares the key and then the original index, so moves with
+    // identical ordering scores keep the order the generator produced. That is
+    // *more* deterministic than the previous unstable comparator, which was
+    // free to permute equal-keyed moves arbitrarily.
+    keyed[..n].sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    for (i, &(_, _, m)) in keyed[..n].iter().enumerate() {
+        moves.set(i, m);
+    }
 }
 
 /// Convenience: the mover's role for a quiet-move history update at `pos`

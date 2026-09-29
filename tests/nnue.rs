@@ -180,6 +180,7 @@ fn shared_with(net: Option<&'static Arc<Network>>) -> SearchShared {
     SearchShared {
         tt: Arc::new(morstilia::tt::TranspositionTable::new(1)),
         params: Arc::new(EvalParams::default()),
+        sp: Arc::new(morstilia::search::params::SearchParams::default()),
         stop: Arc::new(AtomicBool::new(false)),
         nodes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         node_cap: None,
@@ -423,13 +424,13 @@ fn make_child_agrees_with_a_full_refresh_of_the_child() {
         let shared = shared_with(Some(n));
         thread.refresh_root(&pos, n);
 
-        let parent_eval = thread.evaluate_at(&pos, &shared, 0);
+        let parent_eval = thread.evaluate_at(&pos, &shared, 0, pos.is_check());
         let parent_slot = thread.accumulator(0).unwrap().clone();
 
         for m in pos.legal_moves().iter() {
             let mv = m.to_uci();
             let child = thread.make_child(&pos, m, &shared, 1);
-            let child_eval = thread.evaluate_at(&child, &shared, 1);
+            let child_eval = thread.evaluate_at(&child, &shared, 1, child.is_check());
 
             // The incremental slot must equal a full refresh of the child.
             let mut fresh = Accumulator::new();
@@ -454,7 +455,7 @@ fn make_child_agrees_with_a_full_refresh_of_the_child() {
                 &format!("parent slot after {what}"),
             );
             assert_eq!(
-                thread.evaluate_at(&pos, &shared, 0),
+                thread.evaluate_at(&pos, &shared, 0, pos.is_check()),
                 parent_eval,
                 "parent score after {what}"
             );
@@ -518,7 +519,7 @@ fn a_null_move_child_reuses_the_parents_accumulator_verbatim() {
         let shared = shared_with(Some(n));
         thread.refresh_root(&pos, n);
         let before = thread.accumulator(0).unwrap().clone();
-        let nulled = thread.make_child_null(&pos, &shared, 1);
+        let nulled = thread.make_child_null(pos.null_move().unwrap(), &shared, 1);
 
         // Passing changes nothing, so the child slot is a byte-for-byte copy.
         assert_same_accumulator(
@@ -539,7 +540,7 @@ fn a_null_move_child_reuses_the_parents_accumulator_verbatim() {
             &format!("null move in {fen} vs a full refresh"),
         );
         assert_eq!(
-            thread.evaluate_at(&nulled, &shared, 1),
+            thread.evaluate_at(&nulled, &shared, 1, nulled.is_check()),
             evaluate(n, &nulled, &fresh)
         );
         checked += 1;
@@ -623,7 +624,7 @@ fn an_unwritten_slot_self_heals_instead_of_returning_garbage() {
         thread.begin(None);
         let pos = Position::from_fen(fen).unwrap();
         for ply in [0usize, 1, 7, MAX_PLY - 2] {
-            let healed = thread.evaluate_at(&pos, &shared, ply);
+            let healed = thread.evaluate_at(&pos, &shared, ply, pos.is_check());
             let mut fresh = Accumulator::new();
             let board = Board::from_position(&pos);
             for p in Color::ALL {
@@ -649,12 +650,15 @@ fn classical_mode_never_allocates_the_accumulator_stack() {
     for m in pos.legal_moves().iter().take(20) {
         let child = thread.make_child(&pos, m, &shared, 1);
         assert_eq!(
-            thread.evaluate_at(&child, &shared, 1),
+            thread.evaluate_at(&child, &shared, 1, child.is_check()),
             morstilia::evaluation::Evaluator.evaluate_with(&child, &shared.params),
             "classical mode must score exactly like the classical evaluator"
         );
     }
-    assert_eq!(thread.evaluate_at(&pos, &shared, 0), classical);
+    assert_eq!(
+        thread.evaluate_at(&pos, &shared, 0, pos.is_check()),
+        classical
+    );
     assert!(
         thread.accumulator(0).is_none(),
         "classical mode allocated the NNUE stack"
@@ -673,7 +677,7 @@ fn a_fresh_search_cannot_inherit_the_previous_searchs_accumulators() {
     let b = Position::from_fen(SEARCH_FENS[1]).unwrap();
 
     thread.refresh_root(&a, n);
-    let score_a = thread.evaluate_at(&a, &shared, 0);
+    let score_a = thread.evaluate_at(&a, &shared, 0, a.is_check());
 
     thread.begin(None);
     assert_eq!(
@@ -681,7 +685,7 @@ fn a_fresh_search_cannot_inherit_the_previous_searchs_accumulators() {
         [false, false],
         "begin() must invalidate every slot"
     );
-    let score_b = thread.evaluate_at(&b, &shared, 0);
+    let score_b = thread.evaluate_at(&b, &shared, 0, b.is_check());
 
     let mut fresh_b = Accumulator::new();
     let board = Board::from_position(&b);
@@ -695,7 +699,7 @@ fn a_fresh_search_cannot_inherit_the_previous_searchs_accumulators() {
     );
     // Scoring A again, after B, must still give A's score.
     thread.refresh_root(&a, n);
-    assert_eq!(thread.evaluate_at(&a, &shared, 0), score_a);
+    assert_eq!(thread.evaluate_at(&a, &shared, 0, a.is_check()), score_a);
 }
 
 // --- Evaluation purity and determinism -------------------------------------
@@ -708,9 +712,13 @@ fn the_evaluator_is_a_pure_function_of_the_position() {
     for fen in SEARCH_FENS {
         let pos = Position::from_fen(fen).unwrap();
         thread.refresh_root(&pos, n);
-        let first = thread.evaluate_at(&pos, &shared, 0);
+        let first = thread.evaluate_at(&pos, &shared, 0, pos.is_check());
         for _ in 0..8 {
-            assert_eq!(thread.evaluate_at(&pos, &shared, 0), first, "{fen}");
+            assert_eq!(
+                thread.evaluate_at(&pos, &shared, 0, pos.is_check()),
+                first,
+                "{fen}"
+            );
         }
         // A second, independent thread with a cold stack must agree exactly:
         // nothing about the result may depend on how the accumulator got there.
@@ -723,7 +731,11 @@ fn the_evaluator_is_a_pure_function_of_the_position() {
             }
             evaluate(n, &pos, &fresh)
         };
-        assert_eq!(other.evaluate_at(&pos, &shared, 0), want, "{fen}");
+        assert_eq!(
+            other.evaluate_at(&pos, &shared, 0, pos.is_check()),
+            want,
+            "{fen}"
+        );
     }
 }
 
@@ -737,7 +749,7 @@ fn nnue_scores_stay_inside_the_engine_score_range() {
     let shared = shared_with(Some(n));
     for fen in SEARCH_FENS {
         let pos = Position::from_fen(fen).unwrap();
-        let s = thread.evaluate_at(&pos, &shared, 0);
+        let s = thread.evaluate_at(&pos, &shared, 0, pos.is_check());
         assert!(
             s.abs() < morstilia::types::MATE,
             "{fen} scored {s}, which is inside the mate band"
@@ -767,14 +779,14 @@ fn the_start_position_scores_the_same_from_either_side() {
     let shared = shared_with(Some(n));
     let start = Position::from_fen(SEARCH_FENS[0]).unwrap();
     thread.refresh_root(&start, n);
-    let white = thread.evaluate_at(&start, &shared, 0);
+    let white = thread.evaluate_at(&start, &shared, 0, start.is_check());
 
     let black_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1";
     let black = Position::from_fen(black_fen).unwrap();
     thread.refresh_root(&black, n);
     assert_eq!(
         white,
-        thread.evaluate_at(&black, &shared, 0),
+        thread.evaluate_at(&black, &shared, 0, black.is_check()),
         "the start position must score the same from either side to move"
     );
     assert!(
@@ -791,7 +803,7 @@ fn nnue_and_classical_evaluations_both_stay_in_range() {
     let shared_classical = shared_with(None);
     for fen in SEARCH_FENS {
         let pos = Position::from_fen(fen).unwrap();
-        let s = thread.evaluate_at(&pos, &shared_classical, 0);
+        let s = thread.evaluate_at(&pos, &shared_classical, 0, pos.is_check());
         assert!(s.abs() < morstilia::types::MATE, "{fen} scored {s}");
     }
 }
@@ -969,8 +981,8 @@ fn nnue_and_classical_evaluations_generally_differ() {
     for fen in SEARCH_FENS {
         let pos = Position::from_fen(fen).unwrap();
         thread.refresh_root(&pos, n);
-        let a = thread.evaluate_at(&pos, &with, 0);
-        let b = thread.evaluate_at(&pos, &without, 0);
+        let a = thread.evaluate_at(&pos, &with, 0, pos.is_check());
+        let b = thread.evaluate_at(&pos, &without, 0, pos.is_check());
         if a != b {
             differed += 1;
         }

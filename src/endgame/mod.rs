@@ -137,6 +137,30 @@ impl Default for Syzygy {
     }
 }
 
+impl Clone for Syzygy {
+    /// A **second handle to the same tables**, with its own probe counters.
+    ///
+    /// The weight-bearing state is the `Arc<Mutex<Tablebase>>`, and that is
+    /// shared: cloning does not re-read 100 MB of `.rtbw` files, and two handles
+    /// provably see the same tables. The counters are deliberately *not* shared —
+    /// they are per-handle instrumentation, and summing two engines' probe
+    /// counts because they happened to clone a handle would be a worse lie than
+    /// losing them.
+    fn clone(&self) -> Syzygy {
+        Syzygy {
+            inner: self.inner.clone(),
+            max_pieces: self.max_pieces,
+            loaded_files: self.loaded_files,
+            probes: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            wins: AtomicU64::new(0),
+            draws: AtomicU64::new(0),
+            losses: AtomicU64::new(0),
+            cursed: AtomicU64::new(0),
+        }
+    }
+}
+
 impl Syzygy {
     /// An inert tablebase: no tables, every probe answers `None` and the
     /// piece-count gate keeps the search off it entirely.

@@ -65,9 +65,22 @@ pub const CAP_HIST_MAX_ADJ: i32 = 2047;
 /// The search records one of these per ply as it walks down a line; the
 /// previous move's `(from, to)` keys the countermove table and the previous
 /// two `(piece, to)` contexts key the continuation table.
+///
+/// `piece` and `landed` are the same role except after a promotion, where
+/// `piece` is the pawn that moved and `landed` the queen it became. They are
+/// kept apart rather than collapsed because the two consumers want different
+/// ones: the move-ordering tables key on the role that *moved* (a `b7` push is
+/// a pawn move for ordering purposes, and a promotion should not silently
+/// re-file a pawns table entry as a queen's), while Stockfish's correction
+/// history keys on `pos.piece_on(m.to_sq())` — the role standing on the
+/// destination *after* the move. Collapsing the two would make one of the two
+/// consumers wrong.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MoveCtx {
+    /// The role that moved, before any promotion.
     pub piece: usize,
+    /// The role standing on `to` after the move, promotion applied.
+    pub landed: usize,
     pub from: Square,
     pub to: Square,
 }
@@ -79,6 +92,7 @@ impl MoveCtx {
     pub fn of(pos: &crate::board::Position, m: RawMove) -> Option<MoveCtx> {
         pos.board().piece_at(m.from()).map(|p| MoveCtx {
             piece: p.role as usize,
+            landed: m.promotion().unwrap_or(p.role) as usize,
             from: m.from(),
             to: m.to(),
         })
@@ -142,12 +156,6 @@ impl History {
         self.counter.fill(RawMove::NULL);
         self.continuation.fill(0);
         self.capture.fill(0);
-    }
-
-    /// Clears only the countermove table (kept cheap for `setoption`-driven
-    /// resets that should not lose long-term history).
-    pub fn clear_counter(&mut self) {
-        self.counter.fill(RawMove::NULL);
     }
 
     // --- reads -------------------------------------------------------------

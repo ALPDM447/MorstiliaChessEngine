@@ -46,6 +46,7 @@ use crate::board::Position;
 use crate::evaluation::EvalParams;
 use crate::openings::OpeningSuite;
 use crate::rating::{GameResult, Sprt, SprtConfig, SprtDecision, Wdl};
+use crate::search::params::SearchParams;
 use crate::search::{Searcher, TimeLimit};
 use crate::selfplay::{Outcome, Termination, record, san_of, terminal_state};
 use crate::types::{RawMove, is_mate};
@@ -76,6 +77,26 @@ pub struct EngineConfig {
     pub syzygy: Option<Arc<crate::endgame::Syzygy>>,
     /// Human-readable Syzygy state for reports (`none`, or a load summary).
     pub syzygy_label: String,
+    /// Search parameters this side searches with: the singular / multi-cut /
+    /// negative-extension margins, the modern LMR formula, IIR and the
+    /// pruning thresholds.
+    ///
+    /// Separate from `params` because the two are tuned for different things
+    /// and changed for different reasons: `params` is the evaluator's lens,
+    /// `search_params` is *how the search spends time looking through it*. A
+    /// report records both fingerprints, so an A/B result can never be
+    /// attributed to the wrong one.
+    pub search_params: SearchParams,
+    /// Short label for the search parameter set in reports.
+    pub search_params_label: String,
+    /// Evaluator identity for this side.
+    pub nnue: EngineEvaluator,
+    /// The decoded net, shared read-only across every game and every thread.
+    ///
+    /// `None` in classical mode. Decoding is ~0.25 s in release, so it is done
+    /// once by the caller and cloned as an `Arc`; loading it per game would put
+    /// 100 MB of LEB128 decoding inside the measured match time.
+    pub net: Option<Arc<crate::nnue::network::Network>>,
 }
 
 impl EngineConfig {
@@ -94,8 +115,95 @@ impl EngineConfig {
             hash_mb: 16,
             syzygy: None,
             syzygy_label: "none".to_string(),
+            search_params: SearchParams::default(),
+            search_params_label: "search-params-default".to_string(),
+            nnue: EngineEvaluator::Nnue,
+            net: None,
         }
     }
+
+    /// Attaches a search parameter set. The label defaults to the parameter
+    /// set's own fingerprint, so a report always names exactly what ran.
+    pub fn with_search_params(mut self, sp: SearchParams) -> EngineConfig {
+        self.search_params_label = sp.fingerprint();
+        self.search_params = sp;
+        self
+    }
+
+    /// Attaches an explicit label (e.g. a TOML path) to the search parameters.
+    pub fn with_search_params_label(mut self, label: &str) -> EngineConfig {
+        self.search_params_label = label.to_string();
+        self
+    }
+
+    /// Selects the evaluator and hands it the already-decoded net.
+    ///
+    /// Does **not** load anything: the net is decoded once by the caller and
+    /// shared, so two sides declared `Nnue` provably searched with the same
+    /// weights, and a `Classical` side provably searched with none.
+    pub fn with_evaluator(
+        mut self,
+        ev: EngineEvaluator,
+        net: Option<Arc<crate::nnue::network::Network>>,
+    ) -> EngineConfig {
+        self.nnue = ev;
+        self.net = if ev == EngineEvaluator::Nnue {
+            net
+        } else {
+            None
+        };
+        self
+    }
+}
+
+/// Which evaluator a match side searches with.
+///
+/// A label, not a net: the weights are loaded once and shared across both
+/// sides, so the only thing that can differ is *which* evaluator was chosen.
+/// Recording it is what stops an A/B run from silently comparing an NNUE
+/// candidate against a classical baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EngineEvaluator {
+    /// The Stockfish 19 net embedded in the binary.
+    #[default]
+    Nnue,
+    /// The hand-written evaluation.
+    Classical,
+}
+
+impl EngineEvaluator {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EngineEvaluator::Nnue => "nnue",
+            EngineEvaluator::Classical => "classical",
+        }
+    }
+
+    /// The identity of the net this evaluator implies.
+    ///
+    /// `None` for the classical evaluator, which has no net to identify — and
+    /// that is the point: a report must be able to say "no net was involved",
+    /// not leave the field empty and let a reader assume one was.
+    pub fn net_identity(self) -> Option<NetIdentity> {
+        match self {
+            EngineEvaluator::Nnue => Some(NetIdentity {
+                hash: u64::from(crate::nnue::NETWORK_HASH),
+                file: crate::nnue::DEFAULT_NET_FILE.to_string(),
+            }),
+            EngineEvaluator::Classical => None,
+        }
+    }
+}
+
+/// Frozen identity of the NNUE net a match was played with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetIdentity {
+    /// The network's built-in architecture/weight hash, widened to `u64` so a
+    /// future wider hash is not a breaking change to the report format.
+    pub hash: u64,
+    /// The file the net came from (`embedded` or an explicit path).
+    pub file: String,
 }
 
 /// Which engine the match's W/D/L/Elo/SPRT speak for.
@@ -399,8 +507,20 @@ pub fn play_match_game(
 
     let white_was_a = !alternate_colors || game_no.is_multiple_of(2);
 
+    // One searcher per side, each carrying *its own* evaluation parameters,
+    // search parameters and gates. The two never share a `Searcher`, so an
+    // A/B over search parameters cannot leak across the sides — a shared one
+    // would make a "candidate vs baseline" match silently compare a candidate
+    // against itself the moment the parameters were swapped in.
     let mut white_searcher = Searcher::with_params(white.hash_mb, white.params.clone());
+    white_searcher.set_search_params(white.search_params.clone());
     let mut black_searcher = Searcher::with_params(black.hash_mb, black.params.clone());
+    black_searcher.set_search_params(black.search_params.clone());
+    // The net was decoded once by the caller and is shared read-only, so a
+    // classical candidate against an NNUE baseline is a configuration error
+    // the report can now *show*, not something the match silently papers over.
+    white_searcher.set_nnue(white.net.clone());
+    black_searcher.set_nnue(black.net.clone());
     if let Some(tb) = &white.syzygy {
         white_searcher.tb = tb.clone();
     }
@@ -611,6 +731,16 @@ pub struct EngineSummary {
     pub threads: usize,
     pub hash_mb: usize,
     pub syzygy: String,
+    /// Fingerprint (or label) of the search parameter set. Present so a
+    /// search-parameter A/B is self-describing in the report file alone.
+    pub search_params: String,
+    /// The `[gates]` fingerprint, so "which mechanisms were on" is recorded
+    /// even when the numbers are identical.
+    pub search_gates: String,
+    /// Which evaluator this side used (`nnue` / `classical`).
+    pub evaluator: String,
+    /// The net identity, `None` for the classical evaluator.
+    pub net: Option<NetIdentity>,
 }
 
 /// Frozen engine identity at the time the match was played.
@@ -754,6 +884,21 @@ fn validate_resume(cfg: &MatchConfig, resume: &MatchReport) -> anyhow::Result<()
         && resume.black.name == b.name
         && resume.black.threads == b.threads
         && resume.black.hash_mb == b.hash_mb;
+    // The search parameters, the gate set, the evaluator and the net are part
+    // of "which engine" just as much as the name is. Without this a resumed
+    // match could play its first ten games with the Stockfish 19 defaults and
+    // its last ten with every mechanism switched off, and the report would
+    // present the result as one homogeneous match. That is not a rounding
+    // error; it is a fabricated result, and it is invisible in the W/D/L
+    // column that is the whole point of the run.
+    let identity_ok = resume.white.search_params == w.search_params_label
+        && resume.black.search_params == b.search_params_label
+        && resume.white.search_gates == gates_fingerprint(&w.search_params.gates)
+        && resume.black.search_gates == gates_fingerprint(&b.search_params.gates)
+        && resume.white.evaluator == w.nnue.as_str()
+        && resume.black.evaluator == b.nnue.as_str()
+        && resume.white.net == engine_net_identity(w)
+        && resume.black.net == engine_net_identity(b);
     let sprt_ok = match (&resume.sprt, &cfg.sprt) {
         (Some(r), Some(c)) => {
             (r.elo0 - c.elo0).abs() < 1e-9
@@ -773,12 +918,14 @@ fn validate_resume(cfg: &MatchConfig, resume: &MatchReport) -> anyhow::Result<()
         && tc_ok
         && engine_ok
         && sprt_ok
+        && identity_ok
     {
         Ok(())
     } else {
         bail!(
             "resume report does not match the current configuration \
-             (seed {}, suite {:?}, tc {:?}, colors {:?}, engines {:?} vs {:?}, threads/hash/sprt differ); \
+             (seed {}, suite {:?}, tc {:?}, colors {:?}, engines {:?} vs {:?}, \
+              threads/hash/sprt/search-params/gates/evaluator/net differ); \
              refusing to mix incompatible matches",
             resume.seed,
             resume.suite,
@@ -788,6 +935,18 @@ fn validate_resume(cfg: &MatchConfig, resume: &MatchReport) -> anyhow::Result<()
             b.name
         );
     }
+}
+
+/// The net an [`EngineConfig`] will *actually* search with, as the
+/// `(hash, file)` pair the report records.
+///
+/// `None` for the classical evaluator — and also for an `Nnue` evaluator with no
+/// net attached, which is a misconfiguration the caller is expected to have
+/// caught earlier. That is the point of the `is_some` filter: a report must be
+/// able to say "no net was involved" rather than carry a hash for weights that
+/// were never loaded, because a reader has no way to tell those apart.
+fn engine_net_identity(cfg: &EngineConfig) -> Option<NetIdentity> {
+    cfg.nnue.net_identity().filter(|_| cfg.net.is_some())
 }
 
 /// Runs a match. `resume` continues an aborted match from its completed games
@@ -941,6 +1100,10 @@ pub fn run_match(
             threads: cfg.white.threads,
             hash_mb: cfg.white.hash_mb,
             syzygy: cfg.white.syzygy_label.clone(),
+            search_params: cfg.white.search_params_label.clone(),
+            search_gates: gates_fingerprint(&cfg.white.search_params.gates),
+            evaluator: cfg.white.nnue.as_str().to_string(),
+            net: engine_net_identity(&cfg.white),
         },
         black: EngineSummary {
             name: cfg.black.name.clone(),
@@ -948,6 +1111,10 @@ pub fn run_match(
             threads: cfg.black.threads,
             hash_mb: cfg.black.hash_mb,
             syzygy: cfg.black.syzygy_label.clone(),
+            search_params: cfg.black.search_params_label.clone(),
+            search_gates: gates_fingerprint(&cfg.black.search_params.gates),
+            evaluator: cfg.black.nnue.as_str().to_string(),
+            net: engine_net_identity(&cfg.black),
         },
         wdl: WdlSer::from(&wdl),
         score_rate: wdl.score_rate(),
@@ -1059,6 +1226,20 @@ pub fn suite_by_name(name: &str) -> anyhow::Result<OpeningSuite> {
         "classical-v1" => Ok(OpeningSuite::classical_v1()),
         other => bail!("unknown opening suite {other:?} (available: classical-v1)"),
     }
+}
+
+/// A stable `name=0/1;` fingerprint of a gate set.
+///
+/// Deliberately not folded into [`SearchParams::fingerprint`]: the flat
+/// parameter vector and the switch set are tuned by different tools, and a
+/// report that could not tell them apart could not explain a result.
+pub fn gates_fingerprint(gates: &crate::search::params::SearchGates) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(64);
+    for name in crate::search::params::SearchGates::NAMES {
+        let _ = write!(s, "{name}={};", i32::from(gates.get(name).unwrap_or(false)));
+    }
+    s
 }
 
 /// An FNV-1a 64-bit fingerprint of the engine's own source: every `*.rs`

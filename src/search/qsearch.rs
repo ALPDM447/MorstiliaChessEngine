@@ -59,11 +59,14 @@ pub fn qsearch(
     }
     thread.stats.qsearch_nodes += 1;
     if ply >= MAX_PLY - 1 {
-        return thread.evaluate_at(pos, shared, ply);
+        return thread.raw_evaluate_at(pos, shared, ply);
     }
 
     let in_check = pos.is_check();
-    let static_eval = thread.evaluate_at(pos, shared, ply);
+    // Stockfish never stands pat in check, so it never reads a correction there
+    // either; `evaluate_at` applies the same rule, and this is the only call
+    // site in quiescence that needs one.
+    let static_eval = thread.evaluate_at(pos, shared, ply, in_check);
     let mut moves = if in_check {
         pos.legal_moves()
     } else {
@@ -203,6 +206,7 @@ mod tests {
         let shared = SearchShared {
             tt: empty_tt,
             params: default_params,
+            sp: Arc::new(crate::search::params::SearchParams::default()),
             stop,
             nodes: Arc::new(AtomicU64::new(0)),
             node_cap: None,
@@ -223,6 +227,7 @@ mod tests {
         let shared = SearchShared {
             tt: empty_tt,
             params: default_params,
+            sp: Arc::new(crate::search::params::SearchParams::default()),
             stop,
             nodes: Arc::new(AtomicU64::new(0)),
             node_cap: None,
@@ -325,6 +330,7 @@ mod tests {
         let shared = SearchShared {
             tt: empty_tt,
             params: default_params,
+            sp: Arc::new(crate::search::params::SearchParams::default()),
             stop,
             nodes: Arc::new(AtomicU64::new(0)),
             node_cap: None,
@@ -478,6 +484,7 @@ mod tests {
         let shared = SearchShared {
             tt: empty_tt,
             params: default_params,
+            sp: Arc::new(crate::search::params::SearchParams::default()),
             stop,
             nodes: Arc::new(AtomicU64::new(0)),
             node_cap: None,

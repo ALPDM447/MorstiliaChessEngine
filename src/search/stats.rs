@@ -82,6 +82,38 @@ pub struct SearchStats {
     pub tb_losses: u64,
     /// Leaves resolved to a cursed win or blessed loss (50-move sensitive).
     pub tb_cursed: u64,
+
+    // --- Singular Extensions ---
+    /// Nodes where a TT move was a candidate for singular extension.
+    pub singular_candidates: u64,
+    /// Exclusion searches actually performed.
+    pub singular_tests: u64,
+    /// Exclusion searches that confirmed the move is singular.
+    pub singular_successes: u64,
+    /// Singular extensions applied (depth incremented).
+    pub singular_extensions: u64,
+    /// Singular extension magnitude: +1.
+    pub singular_ext_1: u64,
+    /// Singular extension magnitude: +2.
+    pub singular_ext_2: u64,
+    /// Singular extension magnitude: +3.
+    pub singular_ext_3: u64,
+    /// Exclusion search found the move is NOT singular (failed high).
+    pub singular_failures: u64,
+    /// Exclusion searches that proved the position still fails high over the
+    /// node's *own* beta with the candidate move removed — the multi-cut arm.
+    ///
+    /// Each one eliminates a whole subtree, so this is also the count of
+    /// searches the multi-cut decision saved.
+    pub singular_multicut: u64,
+    /// Negative extensions granted by the third arm of the singular chain,
+    /// where the candidate is shortened in favour of the other moves.
+    pub singular_neg_extensions: u64,
+
+    // --- Internal iterative reductions ---
+    /// Nodes entered one ply shallower because they had no TT move to order
+    /// them with and lay on the previous iteration's line.
+    pub iir_reductions: u64,
 }
 
 impl SearchStats {
@@ -115,6 +147,17 @@ impl SearchStats {
         self.tb_draws += other.tb_draws;
         self.tb_losses += other.tb_losses;
         self.tb_cursed += other.tb_cursed;
+        self.singular_candidates += other.singular_candidates;
+        self.singular_tests += other.singular_tests;
+        self.singular_successes += other.singular_successes;
+        self.singular_extensions += other.singular_extensions;
+        self.singular_ext_1 += other.singular_ext_1;
+        self.singular_ext_2 += other.singular_ext_2;
+        self.singular_ext_3 += other.singular_ext_3;
+        self.singular_failures += other.singular_failures;
+        self.singular_multicut += other.singular_multicut;
+        self.singular_neg_extensions += other.singular_neg_extensions;
+        self.iir_reductions += other.iir_reductions;
     }
 
     /// Share of probes that found an entry, `0..=100`.
@@ -168,12 +211,40 @@ impl SearchStats {
         pct(self.razor_cutoffs, self.razor_attempts)
     }
 
+    /// Share of singular verification searches that produced a positive
+    /// extension — the *precision* of the mechanism. A low rate means most
+    /// candidates are not really forced, which usually indicates the minimum
+    /// depth is too low or the table entries too shallow.
+    pub fn singular_hit_pct(&self) -> f64 {
+        pct(self.singular_extensions, self.singular_tests)
+    }
+
+    /// Share of singular verification searches that ended in a multi-cut.
+    pub fn singular_multicut_pct(&self) -> f64 {
+        pct(self.singular_multicut, self.singular_tests)
+    }
+
+    /// Share of singular verification searches that ended in a negative
+    /// extension. Together with [`SearchStats::singular_multicut_pct`] and
+    /// [`SearchStats::singular_hit_pct`] these three partition the tests, up to
+    /// the fourth outcome (the verification succeeded but proved nothing).
+    pub fn singular_neg_ext_pct(&self) -> f64 {
+        pct(self.singular_neg_extensions, self.singular_tests)
+    }
+
     /// Total nodes whose full search was skipped by a pruning decision: every
     /// per-move prune (futility, history, SEE in the main search, delta and
     /// SEE in quiescence) plus every node-level prune (reverse futility,
     /// razoring, null-move cutoffs, ProbCut cutoffs). Null and ProbCut
     /// *attempts* that failed still searched (the probe itself ran), so only
     /// the successful cutoffs are counted.
+    ///
+    /// A multi-cut is deliberately **not** in this total. It does not skip a
+    /// child, it returns from the node *after already running* a verification
+    /// search, and it is counted separately as
+    /// [`SearchStats::singular_multicut`]; folding it in here would mix a
+    /// subtree saving with a per-child saving and make the field no longer
+    /// comparable across engines.
     pub fn total_pruned(&self) -> u64 {
         self.futility_pruned
             + self.history_pruned
@@ -229,6 +300,17 @@ mod tests {
             tb_draws: 20,
             tb_losses: 4,
             tb_cursed: 2,
+            singular_candidates: 0,
+            singular_tests: 0,
+            singular_successes: 0,
+            singular_extensions: 0,
+            singular_ext_1: 0,
+            singular_ext_2: 0,
+            singular_ext_3: 0,
+            singular_failures: 0,
+            singular_multicut: 0,
+            singular_neg_extensions: 0,
+            iir_reductions: 0,
         };
         let b = SearchStats {
             qsearch_nodes: 5,
@@ -258,6 +340,17 @@ mod tests {
             tb_draws: 5,
             tb_losses: 1,
             tb_cursed: 1,
+            singular_candidates: 0,
+            singular_tests: 0,
+            singular_successes: 0,
+            singular_extensions: 0,
+            singular_ext_1: 0,
+            singular_ext_2: 0,
+            singular_ext_3: 0,
+            singular_failures: 0,
+            singular_multicut: 0,
+            singular_neg_extensions: 0,
+            iir_reductions: 0,
         };
         a.add(&b);
         assert_eq!(a.qsearch_nodes, 15);
@@ -323,6 +416,57 @@ mod tests {
         assert_eq!(s.tt_hit_pct(), 0.0);
         assert_eq!(s.first_move_cutoff_pct(), 0.0);
         assert_eq!(s.avg_moves_until_cutoff(), 0.0);
+        assert_eq!(s.total_pruned(), 0);
+        assert_eq!(s.singular_hit_pct(), 0.0);
+        assert_eq!(s.singular_multicut_pct(), 0.0);
+        assert_eq!(s.singular_neg_ext_pct(), 0.0);
+    }
+
+    #[test]
+    fn the_singular_chains_outcomes_merge() {
+        let a = SearchStats {
+            singular_tests: 10,
+            singular_extensions: 4,
+            singular_multicut: 3,
+            singular_neg_extensions: 2,
+            iir_reductions: 7,
+            ..SearchStats::default()
+        };
+        let b = SearchStats {
+            singular_tests: 6,
+            singular_extensions: 1,
+            singular_multicut: 2,
+            singular_neg_extensions: 3,
+            iir_reductions: 5,
+            ..SearchStats::default()
+        };
+        let mut m = a;
+        m.add(&b);
+        assert_eq!(m.singular_tests, 16);
+        assert_eq!(m.singular_extensions, 5);
+        assert_eq!(m.singular_multicut, 5);
+        assert_eq!(m.singular_neg_extensions, 5);
+        assert_eq!(m.iir_reductions, 12);
+        // The three arms are mutually exclusive, so they can never sum to more
+        // than the number of verification searches.
+        assert!(
+            m.singular_extensions + m.singular_multicut + m.singular_neg_extensions
+                <= m.singular_tests
+        );
+        assert!((m.singular_hit_pct() - 5.0 / 16.0 * 100.0).abs() < 1e-9);
+        assert!((m.singular_multicut_pct() - 5.0 / 16.0 * 100.0).abs() < 1e-9);
+        assert!((m.singular_neg_ext_pct() - 5.0 / 16.0 * 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn multicut_is_not_part_of_total_pruned() {
+        // A multi-cut returns *after* running a verification search, so counting
+        // it as a skipped child would corrupt the cross-engine comparison the
+        // field exists for.
+        let s = SearchStats {
+            singular_multicut: 100,
+            ..SearchStats::default()
+        };
         assert_eq!(s.total_pruned(), 0);
     }
 }

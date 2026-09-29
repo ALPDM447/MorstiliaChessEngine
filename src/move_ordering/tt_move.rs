@@ -28,6 +28,16 @@ pub const KILLER1_TIER: i32 = 800_000;
 /// Ordering tier for the second killer move.
 pub const KILLER2_TIER: i32 = 799_999;
 
+/// Ordering tier for captures that *lose* material on the static exchange
+/// evaluation, i.e. Stockfish's `BAD_CAPTURE` stage.
+///
+/// It sits **below every quiet score**: a quiet score is at most
+/// `history + HIST_MAX + continuation`, so with `HIST_MAX = 32_767` the quiet
+/// range is `[-(32_767 + 32_767), 32_767 + 32_767]` and this tier is one
+/// further negative. That makes the demotion a pure key comparison — no second
+/// sort pass, no re-ordering of the move list.
+pub const BAD_CAPTURE_TIER: i32 = -1_000_000;
+
 /// The captured piece's value in the MVV-LVA sense: the piece on `to`, or a
 /// pawn for en passant, or 0 for a pure promotion. Reads the tunable material
 /// values from `p` (kept consistent with SEE and the evaluation).

@@ -325,6 +325,19 @@ pub struct Network {
     pub description: String,
 }
 
+/// A `Network` is 100 MB of decoded weights; printing it would be useless and
+/// ruinous. The identity that actually matters — the network hash and the
+/// description the trainer wrote — is what a `Debug` line should carry, so a
+/// match report or a log line naming a net is enough to identify it exactly.
+impl std::fmt::Debug for Network {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Network")
+            .field("hash", &format_args!("{:#010x}", NETWORK_HASH))
+            .field("description", &self.description)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Deref for Network {
     type Target = FeatureTransformer;
 

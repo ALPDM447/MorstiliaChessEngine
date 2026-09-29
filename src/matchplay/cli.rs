@@ -1,7 +1,7 @@
 //! Command-line driver for engine-vs-engine matches (Stage 8).
 //!
-//! `selfplay` (alias `morstilia-selfplay`) runs a reproducible match between
-//! two engine configurations and reports the honest strength signal:
+//! `selfplay` runs a reproducible match between two engine configurations
+//! and reports the honest strength signal:
 //!
 //! ```text
 //! W/D/L counts, score rate, logistic Elo + 95% Wilson confidence interval,
@@ -30,16 +30,18 @@
 //! dataset line) go to **stderr**; the summary goes to **stdout**.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
 
 use crate::board::Position;
 use crate::evaluation::EvalParams;
 use crate::matchplay::{
-    BASELINE_TAG, CandidateSide, EngineConfig, MatchConfig, MatchReport, TimeControl, load_syzygy,
-    run_match, suite_by_name, write_match_pgn,
+    BASELINE_TAG, CandidateSide, EngineConfig, EngineEvaluator, MatchConfig, MatchReport,
+    TimeControl, load_syzygy, run_match, suite_by_name, write_match_pgn,
 };
 use crate::rating::SprtConfig;
+use crate::search::params::{SearchGates, SearchParams};
 use crate::selfplay::{GameRecord, Outcome, Termination};
 
 const USAGE: &str = "\
@@ -61,6 +63,24 @@ Options:
                         are byte-identical to sequential at any N)
   --white FILE          eval params TOML for side A (default: baseline)
   --black FILE          eval params TOML for side B (default: baseline)
+  --search-params FILE  search params TOML for both sides (default: the built-in
+                        Stockfish 19 defaults). The singular/multi-cut margins,
+                        the modern LMR formula, IIR and the pruning thresholds.
+  --white-search-params FILE
+  --black-search-params FILE
+                        per-side search params; overrides --search-params for
+                        that side. This is the A/B axis for a search-parameter
+                        experiment: two files, one suite, one seed.
+  --search-gate NAME=BOOL
+                        switch one ported mechanism off. Repeatable and applies
+                        to both sides unless prefixed, e.g.
+                        --white-search-gate singular=false.
+  --eval MODE           nnue|classical for both sides (default nnue)
+  --white-eval MODE     per-side evaluator
+  --black-eval MODE
+  --nnue FILE           use a different .nnue net for both NNUE sides
+  --white-nnue FILE     per-side net
+  --black-nnue FILE
   --hash MB             TT size per side (default 16)
   --white-hash MB       TT size for side A
   --black-hash MB       TT size for side B
@@ -75,6 +95,10 @@ Options:
   --adjudicate-mate B   end when the search proves a forced mate (default on)
   --syzygy DIR          Syzygy tables for both sides (optional; a bad path is
                         reported but never fatal)
+  --ab-sf19             the documented Stockfish-19 A/B: white = every
+                        mechanism OFF (the pre-port search), black = the
+                        shipped SF19 defaults, candidate = black. Refuses to
+                        be combined with any --search-params/--search-gate
   --sprt                auto-stop when the SPRT decides (default off: play
                         exactly --games and print a diagnostic SPRT)
   --sprt-elo0 F         H0 advantage of the SPRT (default -2.0)
@@ -101,6 +125,14 @@ Examples:
   selfplay --resume results/a10.json --games 2000 --report results/a10-full.json
   selfplay --candidate white --sprt --games 1000 \\
            --white tuned.toml --black baseline --sprt-elo0 -2 --sprt-elo1 3
+  selfplay --games 2000 --depth 12 --seed 7 \\
+           --search-params tuned-search.toml \\
+           --report results/sf19-search.json   # whole-engine A/B
+  selfplay --games 2000 --depth 12 --seed 7 \\
+           --white-search-gate singular=false \\
+           --report results/no-singular.json   # single-mechanism A/B
+  selfplay --games 2000 --depth 12 --seed 7 --ab-sf19 --sprt \\
+           --report results/sf19-ab.json       # the headline A/B
   selfplay --compare new.json baseline.json   # A-vs-B regression verdict
 
 The match is deterministic for a given seed at Threads = 1 depth control:
@@ -108,7 +140,7 @@ same inputs, same games. Strength is reported as W/D/L + Elo + 95% CI +
 SPRT — never nodes or NPS.
 ";
 
-/// Entry point shared by the `selfplay` and `morstilia-selfplay` binaries.
+/// Entry point of the `selfplay` binary.
 pub fn main() {
     let prog = std::env::args()
         .next()
@@ -152,6 +184,18 @@ fn run(args: &[String]) -> anyhow::Result<()> {
         let d = SprtConfig::default();
         (d.elo0, d.elo1, d.alpha, d.beta, d.draw_elo)
     };
+    let mut sp_path: Option<String> = None;
+    let mut white_sp_path: Option<String> = None;
+    let mut black_sp_path: Option<String> = None;
+    let mut white_gates: Vec<(String, bool)> = Vec::new();
+    let mut black_gates: Vec<(String, bool)> = Vec::new();
+    let mut eval_mode: Option<EngineEvaluator> = None;
+    let mut white_eval: Option<EngineEvaluator> = None;
+    let mut black_eval: Option<EngineEvaluator> = None;
+    let mut net_path: Option<String> = None;
+    let mut white_net: Option<String> = None;
+    let mut black_net: Option<String> = None;
+    let mut ab_sf19 = false;
     let mut out: Option<String> = None;
     let mut report_path: Option<String> = None;
     let mut resume_path: Option<String> = None;
@@ -216,6 +260,18 @@ fn run(args: &[String]) -> anyhow::Result<()> {
                     "--parallel" => parallel = parse_u("--parallel", &v)?,
                     "--white" => white_path = Some(v),
                     "--black" => black_path = Some(v),
+                    "--search-params" => sp_path = Some(v),
+                    "--white-search-params" => white_sp_path = Some(v),
+                    "--black-search-params" => black_sp_path = Some(v),
+                    "--search-gate" => white_gates.push(parse_gate(&v)?),
+                    "--white-search-gate" => white_gates.push(parse_gate(&v)?),
+                    "--black-search-gate" => black_gates.push(parse_gate(&v)?),
+                    "--eval" => eval_mode = Some(parse_evaluator(&v)?),
+                    "--white-eval" => white_eval = Some(parse_evaluator(&v)?),
+                    "--black-eval" => black_eval = Some(parse_evaluator(&v)?),
+                    "--nnue" => net_path = Some(v),
+                    "--white-nnue" => white_net = Some(v),
+                    "--black-nnue" => black_net = Some(v),
                     "--hash" => hash = parse_u("--hash", &v)?,
                     "--white-hash" => white_hash = Some(parse_u("--white-hash", &v)?),
                     "--black-hash" => black_hash = Some(parse_u("--black-hash", &v)?),
@@ -227,6 +283,7 @@ fn run(args: &[String]) -> anyhow::Result<()> {
                     "--adjudicate-mate" => adjudicate = parse_bool("--adjudicate-mate", &v)?,
                     "--no-adjudicate" => adjudicate = false,
                     "--syzygy" => syzygy = Some(v),
+                    "--ab-sf19" => ab_sf19 = true,
                     "--sprt" => sprt_enabled = true,
                     "--sprt-elo0" => elo0 = v.parse().context("--sprt-elo0 must be a number")?,
                     "--sprt-elo1" => elo1 = v.parse().context("--sprt-elo1 must be a number")?,
@@ -280,6 +337,23 @@ fn run(args: &[String]) -> anyhow::Result<()> {
     if max_plies < 1 {
         bail!("--max-plies must be >= 1");
     }
+    // `--ab-sf19` *defines* both sides' search parameters. Letting an explicit
+    // parameter file be silently overridden (or the reverse) is exactly the
+    // kind of quiet precedence rule that makes an A/B report mean something
+    // other than what it says, so the combination is refused outright.
+    if ab_sf19
+        && (sp_path.is_some()
+            || white_sp_path.is_some()
+            || black_sp_path.is_some()
+            || !white_gates.is_empty()
+            || !black_gates.is_empty())
+    {
+        bail!(
+            "--ab-sf19 sets both sides' search parameters itself; it cannot be combined \
+             with --search-params/--white-search-params/--black-search-params or \
+             --search-gate/--white-search-gate/--black-search-gate"
+        );
+    }
 
     // --- build the two sides ------------------------------------------------
     let suite = suite_by_name(&suite_name)?;
@@ -292,6 +366,18 @@ fn run(args: &[String]) -> anyhow::Result<()> {
     let (wb, wbl) = load_syzygy(syzygy.as_deref());
     white.syzygy = wb;
     white.syzygy_label = wbl;
+    {
+        let path = white_sp_path.as_deref().or(sp_path.as_deref());
+        let sp = load_search_params(path, &white_gates)?;
+        eprintln!(
+            "search params (white): {}  fingerprint {}",
+            path.unwrap_or("built-in defaults"),
+            sp.fingerprint()
+        );
+        white = white
+            .with_search_params(sp)
+            .with_search_params_label(path.unwrap_or("built-in defaults"));
+    }
 
     let black_params = load_params(black_path.as_deref())?;
     let mut black = EngineConfig::new(name_of(black_path.as_deref()), black_params);
@@ -301,6 +387,92 @@ fn run(args: &[String]) -> anyhow::Result<()> {
     let (bb, bbl) = load_syzygy(syzygy.as_deref());
     black.syzygy = bb;
     black.syzygy_label = bbl;
+    {
+        let path = black_sp_path.as_deref().or(sp_path.as_deref());
+        let sp = load_search_params(path, &black_gates)?;
+        eprintln!(
+            "search params (black): {}  fingerprint {}",
+            path.unwrap_or("built-in defaults"),
+            sp.fingerprint()
+        );
+        black = black
+            .with_search_params(sp)
+            .with_search_params_label(path.unwrap_or("built-in defaults"));
+    }
+
+    // --- evaluator ---------------------------------------------------------
+    // The net is decoded once here, never per game: 100 MB of LEB128 inside a
+    // measured match would dominate every time control.
+    let white_eval = white_eval.or(eval_mode).unwrap_or_default();
+    let black_eval = black_eval.or(eval_mode).unwrap_or_default();
+    if white_eval != black_eval {
+        eprintln!(
+            "matchplay: evaluator mismatch ({} vs {}): this is a deliberate cross-evaluator A/B, not a search A/B",
+            white_eval.as_str(),
+            black_eval.as_str()
+        );
+    }
+    let (white_net, black_net) = load_nets(
+        net_path.as_deref(),
+        white_net.as_deref(),
+        black_net.as_deref(),
+    )?;
+    if (white_eval == EngineEvaluator::Nnue) != (white_net.is_some())
+        || (black_eval == EngineEvaluator::Nnue) != (black_net.is_some())
+    {
+        bail!(
+            "NNUE was requested but no net could be loaded (pass --nnue FILE, or --eval classical)"
+        );
+    }
+    // One decoded net shared by `Arc` means *provably* identical weights; two
+    // separate decodes mean the A/B measures the nets, not the search. Either
+    // way the report says which, and a mismatch is announced here.
+    let nets_identical = match (&white_net, &black_net) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    if !nets_identical {
+        eprintln!(
+            "matchplay: WARNING: the two sides use *different* NNUE nets; the result measures the nets, not the search"
+        );
+    }
+    eprintln!(
+        "evaluator: {} vs {}{}",
+        white_eval.as_str(),
+        black_eval.as_str(),
+        if white_eval == EngineEvaluator::Nnue {
+            format!("  net hash {:#010x}", crate::nnue::NETWORK_HASH)
+        } else {
+            String::new()
+        }
+    );
+    white = white.with_evaluator(white_eval, white_net);
+    black = black.with_evaluator(black_eval, black_net);
+
+    // --- the documented SF19 A/B --------------------------------------------
+    // White becomes the pre-port search (every gate off) and Black the shipped
+    // Stockfish 19 defaults, and Black becomes the candidate. The point of
+    // spelling it out as a single flag is that *this* is the comparison the
+    // port is claiming to be worth something, and expressing it as
+    // `--search-gate singular=false --search-gate iir=false ...` invites a
+    // typo that silently changes the baseline into a third configuration.
+    if ab_sf19 {
+        let mut baseline = SearchParams::default();
+        baseline.gates = SearchGates::all_off();
+        white = white
+            .with_search_params(baseline)
+            .with_search_params_label("baseline (every SF19 mechanism off)");
+        black = black
+            .with_search_params(SearchParams::default())
+            .with_search_params_label("SF19 defaults (every mechanism on)");
+        candidate = "black".to_string();
+        eprintln!(
+            "A/B: white = {} / black = {}",
+            white.search_params_label, black.search_params_label
+        );
+        eprintln!("     candidate side forced to black");
+    }
 
     let sprt_cfg = SprtConfig {
         elo0,
@@ -354,6 +526,18 @@ fn run(args: &[String]) -> anyhow::Result<()> {
         alternate,
         parallel
     );
+    eprintln!(
+        "search params: white [{}] black [{}]",
+        cfg.white.search_params_label, cfg.black.search_params_label
+    );
+    eprintln!(
+        "gates:        white [{}]",
+        crate::matchplay::gates_fingerprint(&cfg.white.search_params.gates)
+    );
+    eprintln!(
+        "gates:        black [{}]",
+        crate::matchplay::gates_fingerprint(&cfg.black.search_params.gates)
+    );
     if resume.is_some() {
         eprintln!("resuming from completed games (replayed games are byte-identical)");
     }
@@ -391,6 +575,23 @@ fn run(args: &[String]) -> anyhow::Result<()> {
     println!(
         "games: {} completed of {} requested  colors alternate: {}",
         report.games_completed, report.games_requested, report.alternate_colors
+    );
+    println!(
+        "search params: white [{}] black [{}]",
+        report.white.search_params, report.black.search_params
+    );
+    println!(
+        "evaluator: {} vs {}{}",
+        report.white.evaluator,
+        report.black.evaluator,
+        report
+            .white
+            .net
+            .as_ref()
+            .map_or_else(String::new, |n| format!(
+                "  net hash {:#010x} ({})",
+                n.hash, n.file
+            ))
     );
     println!("{wdl}");
     println!(
@@ -544,6 +745,90 @@ fn load_params(path: Option<&str>) -> anyhow::Result<EvalParams> {
             EvalParams::load(p).with_context(|| format!("cannot load eval params from {p:?}"))
         }
     }
+}
+
+/// Parses `NAME=BOOL` for a `--*-search-gate` flag.
+fn parse_gate(v: &str) -> anyhow::Result<(String, bool)> {
+    let (name, on) = v
+        .rsplit_once('=')
+        .with_context(|| format!("--search-gate needs NAME=BOOL, got {v:?}"))?;
+    let on = SearchGates::parse_gate_value(on)
+        .with_context(|| format!("--search-gate {name}: {on:?} is not a boolean"))?;
+    Ok((name.trim().to_string(), on))
+}
+
+fn parse_evaluator(v: &str) -> anyhow::Result<EngineEvaluator> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "nnue" => Ok(EngineEvaluator::Nnue),
+        "classical" => Ok(EngineEvaluator::Classical),
+        other => bail!("--eval must be nnue or classical, got {other:?}"),
+    }
+}
+
+/// Decodes a net once, for one side. `None`/empty path means the net embedded
+/// in the binary. A requested-but-unusable net is a hard error here: unlike over
+/// UCI there is no interactive session to fall back in, and a match that
+/// quietly played classical while the report said `nnue` would be worthless.
+fn load_net(path: Option<&str>) -> anyhow::Result<Arc<crate::nnue::network::Network>> {
+    let loaded = match path {
+        None | Some("") => {
+            crate::nnue::load_embedded_network().context("the embedded NNUE net failed to load")?
+        }
+        Some(p) => {
+            let resolved = crate::nnue::resolve_net_path(p);
+            crate::nnue::load_network(&resolved)
+                .with_context(|| format!("cannot load the NNUE net at {}", resolved.display()))?
+        }
+    };
+    Ok(Arc::new(loaded))
+}
+
+/// Decodes the *distinct* nets both sides ask for.
+///
+/// Two different paths means two different weight sets, and a search-parameter
+/// A/B across them is not an A/B at all — so the mismatch is reported on stderr
+/// rather than being quietly accepted. `None` means no side wants a net.
+fn load_nets(
+    common: Option<&str>,
+    white: Option<&str>,
+    black: Option<&str>,
+) -> anyhow::Result<(
+    Option<Arc<crate::nnue::network::Network>>,
+    Option<Arc<crate::nnue::network::Network>>,
+)> {
+    let white_path = white.or(common);
+    let black_path = black.or(common);
+    if white_path.is_none() && black_path.is_none() {
+        return Ok((None, None));
+    }
+    if white_path == black_path {
+        let net = load_net(white_path)?;
+        return Ok((Some(Arc::clone(&net)), Some(net)));
+    }
+    Ok((Some(load_net(white_path)?), Some(load_net(black_path)?)))
+}
+
+/// Resolves a search-parameter file plus the gates requested on the command
+/// line. An unknown gate name is an error: a typo that silently leaves the
+/// mechanism on is exactly the failure an A/B run cannot detect afterwards.
+fn load_search_params(
+    path: Option<&str>,
+    gates: &[(String, bool)],
+) -> anyhow::Result<SearchParams> {
+    let mut sp = match path {
+        None | Some("") => SearchParams::default(),
+        Some(p) => SearchParams::load(p)
+            .with_context(|| format!("cannot load search params from {p:?}"))?,
+    };
+    for (name, on) in gates {
+        if !sp.gates.set(name, *on) {
+            bail!(
+                "unknown search gate {name:?}; known gates: {}",
+                SearchGates::NAMES.join(", ")
+            );
+        }
+    }
+    Ok(sp)
 }
 
 fn name_of(path: Option<&str>) -> &str {

@@ -38,6 +38,7 @@
 //! material values before releasing the full 864-parameter vector.
 
 pub mod dataset;
+pub mod search;
 
 use crate::book::SplitMix64;
 use crate::evaluation::EvalParams;

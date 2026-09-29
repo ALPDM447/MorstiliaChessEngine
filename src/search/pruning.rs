@@ -4,7 +4,25 @@
 //! constants and their pure helpers together so they are easy to adjust and
 //! unit-test. All margins are in centipawns and grow with depth, because a
 //! deeper search accumulates more (uncertain) positional value.
+//!
+//! Every rule has **two** forms:
+//!
+//! * a `const fn` with the formula spelled out as literals, and
+//! * a `*_sp` function that reads the same formula from
+//!   [`SearchParams`](crate::search::params::SearchParams).
+//!
+//! The two are the *same* function at the default parameter values, and a unit
+//! test (`default_parameters_reproduce_the_compiled_formulas`) asserts that
+//! exhaustively over the whole depth range. That is the mechanism behind the
+//! "moving a threshold into the parameters must not change behaviour" contract:
+//! the literals are the reference, the test is the proof, and no threshold can
+//! be moved into the parameter set without the test noticing a drift.
+//!
+//! The `const fn` forms are retained because the depth-gate relationships
+//! between them are checked at compile time (`depths_are_sane`), which a
+//! runtime parameter set cannot express.
 
+use crate::search::params::SearchParams;
 use crate::types::Depth;
 
 /// Shallow-depth gate for per-move futility pruning.
@@ -84,6 +102,132 @@ pub const HISTORY_PRUNE_THRESHOLD: i32 = -8_000;
 /// After this many searched quiet moves, later quiets become cheap to prune
 /// at shallow depths.
 pub const QUIET_PRUNE_LIMIT: usize = 5;
+
+/// [`futility_margin`] with the coefficients read from `sp`.
+#[inline]
+pub fn futility_margin_sp(sp: &SearchParams, depth: Depth, improving: bool) -> i32 {
+    let base = sp.futility_margin_base + sp.futility_margin_depth * depth;
+    if improving {
+        base - sp.futility_margin_improving
+    } else {
+        base
+    }
+}
+
+/// [`razor_margin`] with the coefficients read from `sp`.
+#[inline]
+pub fn razor_margin_sp(sp: &SearchParams, depth: Depth) -> i32 {
+    sp.razor_margin_base + sp.razor_margin_depth * depth
+}
+
+/// [`reverse_futility_margin`] with the coefficients read from `sp`.
+#[inline]
+pub fn reverse_futility_margin_sp(sp: &SearchParams, depth: Depth, improving: bool) -> i32 {
+    let base = sp.rfp_margin_base + sp.rfp_margin_depth * depth;
+    if improving {
+        base - sp.rfp_margin_improving
+    } else {
+        base
+    }
+}
+
+/// [`probcut_margin`] with the coefficients read from `sp`.
+#[inline]
+pub fn probcut_margin_sp(sp: &SearchParams, depth: Depth) -> i32 {
+    sp.probcut_margin_base + sp.probcut_margin_depth * depth
+}
+
+/// [`null_move_reduction`] with the coefficients read from `sp`.
+#[inline]
+pub fn null_move_reduction_sp(sp: &SearchParams, depth: Depth, improving: bool) -> Depth {
+    sp.null_move_reduction_base
+        + depth / sp.null_move_reduction_div
+        + if improving {
+            0
+        } else {
+            sp.null_move_reduction_stagnant
+        }
+}
+
+/// [`see_prune_threshold`] with the coefficients read from `sp`.
+#[inline]
+pub fn see_prune_threshold_sp(sp: &SearchParams, depth: Depth) -> i32 {
+    -(sp.see_prune_base + sp.see_prune_depth * depth)
+}
+
+/// Stockfish 19 Step 8 — razoring **at the child** (`search.cpp:991-992`).
+///
+/// ```text
+/// if (!PvNode && eval < alpha - 482 * depth * depth)
+///     return qsearch<NonPV>(pos, ss, alpha, beta);
+/// ```
+///
+/// Evaluated in the parent immediately after playing the move, so the child is
+/// dropped into quiescence without ever entering the main search. The quadratic
+/// depth term is what makes this safe near the horizon: at `depth == 1` the
+/// margin is 482 and at `depth == 8` it is 30_848, so a deep child needs an
+/// enormous deficit before it can be abandoned.
+///
+/// Distinct from the node-level razor in this module, which *probes* quiescence
+/// and only returns if the probe confirms the fail-low. The child form is
+/// cheaper (no probe branch back into the main search) and slightly more
+/// aggressive; both may be active, in which case the parent's runs first and
+/// the child's never sees the position.
+#[inline]
+pub fn sf19_child_razor_margin(sp: &SearchParams, depth: Depth) -> i32 {
+    sp.child_razor_margin_base * depth * depth
+}
+
+/// Stockfish 19 Step 9 — reverse futility **at the child**
+/// (`search.cpp:996-1007`).
+///
+/// ```text
+/// futilityMult  = min(45 + depth * 4, 85) - 20 * !ttHit
+/// futilityMargin = futilityMult * depth
+///                - (2789 * improving + 335 * opponentWorsening) * mult / 1024
+///                + |correctionValue| / 198435
+/// if (eval - futilityMargin >= beta)
+///     return (661 * beta + 363 * eval) / 1024;
+/// ```
+///
+/// The blend `(661 * beta + 363 * eval) / 1024` is Stockfish's *smoothed* fail
+/// high: it returns a score strictly between `beta` and `eval` rather than
+/// `eval` itself, so the value stays a valid bound with slack. Returning a bare
+/// `eval` would be a stronger claim than a reduced child search can support.
+///
+/// `opponent_worsening` is the LMR hindsight term
+/// (`ss->reducedDepth` / `opponentWorsening` at `search.cpp:867`); Morstilia
+/// passes it in from [`SearchThread::prior_reduction`], and it is zero when the
+/// `lmr_hindsight` gate is off.
+///
+/// The depth gate is `< 19` (`seekMate ? 6 : 19`) and is *not* tuned in
+/// Stockfish — the comment says so — so the bound is exposed only so the
+/// constant is visible in one place, not so it can be moved casually.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn sf19_child_rfp_margin(
+    sp: &SearchParams,
+    depth: Depth,
+    improving: bool,
+    opponent_worsening: bool,
+    tt_hit: bool,
+    correction_value: i32,
+) -> i32 {
+    let mult = (sp.child_rfp_mult_base + depth * sp.child_rfp_mult_depth)
+        .min(sp.child_rfp_mult_cap)
+        - sp.child_rfp_no_tt * i32::from(!tt_hit);
+    let hindsight = sp.child_rfp_improving * i32::from(improving)
+        + sp.child_rfp_worsening * i32::from(opponent_worsening);
+    mult * depth - hindsight * mult / sp.child_rfp_hindsight_div
+        + correction_value.abs() / sp.child_rfp_correction_div
+}
+
+/// Stockfish 19's smoothed fail-high value for the child RFP
+/// (`search.cpp:1007`).
+#[inline]
+pub fn sf19_child_rfp_value(sp: &SearchParams, beta: i32, eval: i32) -> i32 {
+    (sp.child_rfp_value_beta * beta + sp.child_rfp_value_eval * eval) / sp.child_rfp_value_den
+}
 
 /// True when `side` still has at least one attacking piece (queen, rook,
 /// bishop or knight) on `board`. The null-move gate refuses to pass in pure
@@ -215,5 +359,98 @@ mod tests {
                 "probe at depth {d} must be in [0, {d}): got {probe}"
             );
         }
+    }
+
+    /// The contract that makes it safe to move a threshold into
+    /// [`SearchParams`]: at the default values the parameterised formulas are
+    /// *identically* the compiled literal ones. Checked over the full depth
+    /// range and both `improving` states, for every margin the search uses.
+    #[test]
+    fn default_parameters_reproduce_the_compiled_formulas() {
+        let sp = SearchParams::default();
+        for d in -4..=64 {
+            for improving in [true, false] {
+                assert_eq!(
+                    futility_margin_sp(&sp, d, improving),
+                    futility_margin(d, improving),
+                    "futility_margin at depth {d}, improving={improving}"
+                );
+                assert_eq!(
+                    reverse_futility_margin_sp(&sp, d, improving),
+                    reverse_futility_margin(d, improving),
+                    "reverse_futility_margin at depth {d}, improving={improving}"
+                );
+                assert_eq!(
+                    null_move_reduction_sp(&sp, d, improving),
+                    null_move_reduction(d, improving),
+                    "null_move_reduction at depth {d}, improving={improving}"
+                );
+            }
+            assert_eq!(
+                razor_margin_sp(&sp, d),
+                razor_margin(d),
+                "razor_margin at {d}"
+            );
+            assert_eq!(
+                probcut_margin_sp(&sp, d),
+                probcut_margin(d),
+                "probcut_margin at {d}"
+            );
+            assert_eq!(
+                see_prune_threshold_sp(&sp, d),
+                see_prune_threshold(d),
+                "see_prune_threshold at {d}"
+            );
+        }
+        assert_eq!(sp.futility_depth, FUTILITY_DEPTH);
+        assert_eq!(sp.razor_depth, RAZOR_DEPTH);
+        assert_eq!(sp.rfp_depth, RFP_DEPTH);
+        assert_eq!(sp.null_move_min_depth, NULL_MOVE_MIN_DEPTH);
+        assert_eq!(sp.probcut_depth, PROBCUT_DEPTH);
+        assert_eq!(sp.history_prune_threshold, HISTORY_PRUNE_THRESHOLD);
+        assert_eq!(sp.quiet_prune_limit as usize, QUIET_PRUNE_LIMIT);
+    }
+
+    /// The Stockfish 19 child formulas must reproduce `sf_19`'s constants at
+    /// the default parameter values. The numbers are written out here
+    /// independently of [`SearchParams`] on purpose: a test that simply called
+    /// the same accessor would agree with any drift.
+    #[test]
+    fn child_pruning_reproduces_the_stockfish_constants() {
+        let sp = SearchParams::default();
+        for d in 0..=24 {
+            assert_eq!(
+                sf19_child_razor_margin(&sp, d),
+                482 * d * d,
+                "child razor at depth {d}"
+            );
+        }
+        for d in 0..=24 {
+            for improving in [true, false] {
+                for tt_hit in [true, false] {
+                    for worsening in [true, false] {
+                        let mult = (45 + 4 * d).min(85) - 20 * i32::from(!tt_hit);
+                        let hint = 2789 * i32::from(improving) + 335 * i32::from(worsening);
+                        let want = mult * d - hint * mult / 1024;
+                        assert_eq!(
+                            sf19_child_rfp_margin(&sp, d, improving, worsening, tt_hit, 0),
+                            want,
+                            "child RFP at depth {d} improving={improving} tt_hit={tt_hit} worse={worsening}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            sf19_child_rfp_margin(&sp, 6, true, false, true, 1_984_350),
+            {
+                let mult = (45 + 24).min(85) - 0;
+                mult * 6 - 2789 * mult / 1024 + 1_984_350 / 198435
+            }
+        );
+        assert_eq!(
+            sf19_child_rfp_value(&sp, 200, 400),
+            (661 * 200 + 363 * 400) / 1024
+        );
     }
 }

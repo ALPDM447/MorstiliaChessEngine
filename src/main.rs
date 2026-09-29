@@ -25,6 +25,7 @@ use morstilia::config::{DEFAULT_HASH_MB, DEFAULT_THREADS, EvalMode};
 use morstilia::evaluation::{EvalParams, Evaluator};
 use morstilia::nnue;
 use morstilia::nnue::network::Network;
+use morstilia::search::params::{SearchGates, SearchParams};
 use morstilia::uci::UciEngine;
 
 const USAGE: &str = "\
@@ -33,10 +34,11 @@ Morstilia — a UCI chess engine with a classical and an NNUE evaluator.
 Usage:
   morstilia [--mode uci]                 UCI loop over stdin (default)
   morstilia --perft <depth> [--fen FEN]  perft node counts
-  morstilia --fen FEN --depth N [--threads N] [--hash MB] [--eval-params FILE] [--syzygy DIR] [--eval classical|nnue] [--nnue FILE]   one-shot search
-  morstilia --bench [--depth N] [--threads N] [--hash MB] [--eval-params FILE] [--syzygy DIR] [--eval classical|nnue] [--nnue FILE] [--stats]   fixed benchmark
+  morstilia --fen FEN --depth N [--threads N] [--hash MB] [--eval-params FILE] [--syzygy DIR] [--eval classical|nnue] [--nnue FILE] [--search-params FILE] [--search-gate NAME=BOOL]   one-shot search
+  morstilia --bench [--depth N] [--threads N] [--hash MB] [--eval-params FILE] [--syzygy DIR] [--eval classical|nnue] [--nnue FILE] [--search-params FILE] [--search-gate NAME=BOOL] [--stats]   fixed benchmark
   morstilia --evaluate FEN [--eval-params FILE]   per-component classical evaluation breakdown
   morstilia --export-params FILE          write the baseline eval params as TOML
+  morstilia --export-search-params FILE   write the built-in search params as TOML
   morstilia --version                    print engine identity
 
 Evaluators:
@@ -45,6 +47,17 @@ Evaluators:
   --nnue FILE        use a different .nnue net. Unlike over UCI, a broken or
                      missing net is a hard error here: an explicit --eval nnue
                      on the command line must not silently run something else.
+
+Search:
+  --search-params FILE   TOML file with the search parameters (singular/multi-cut
+                         margins, the modern LMR formula, IIR, the pruning
+                         thresholds). Missing = the built-in Stockfish 19
+                         defaults. Unlike UCI, a bad path is a hard error here.
+  --search-gate NAME=BOOL  switch one ported mechanism off. Repeatable. e.g.
+                         --search-gate singular=false. An unknown name is an
+                         error, never a silent no-op.
+  --export-search-params FILE  writes the defaults, so a tuned file can start
+                         from an exact, complete copy.
 ";
 
 fn main() {
@@ -81,6 +94,7 @@ fn run(args: &[String]) -> anyhow::Result<()> {
         Some("--bench") => cmd_bench(args, i),
         Some("--evaluate") => cmd_evaluate(args, i),
         Some("--export-params") => cmd_export_params(args, i),
+        Some("--export-search-params") => cmd_export_search_params(args, i),
         Some(other) => bail!("unknown argument: {other}"),
     }
 }
@@ -154,6 +168,8 @@ fn cmd_search(args: &[String], i: usize) -> anyhow::Result<()> {
     let mut syzygy: Option<String> = None;
     let mut eval = EvalMode::Nnue;
     let mut net_path: Option<String> = None;
+    let mut sp_path: Option<String> = None;
+    let mut gates: Vec<(String, bool)> = Vec::new();
     while j < args.len() {
         let flag = args[j].clone();
         match flag_value(args, &mut j, &flag) {
@@ -167,6 +183,8 @@ fn cmd_search(args: &[String], i: usize) -> anyhow::Result<()> {
                 hash = v.parse().context("--hash must be an integer (MB)")?
             }
             Some(v) if flag == "--eval-params" => params_path = Some(v),
+            Some(v) if flag == "--search-params" => sp_path = Some(v),
+            Some(v) if flag == "--search-gate" => gates.push(parse_gate_arg(&v)?),
             Some(v) if flag == "--syzygy" => syzygy = Some(v),
             Some(v) if flag == "--eval" => {
                 eval = EvalMode::parse(&v)
@@ -177,6 +195,7 @@ fn cmd_search(args: &[String], i: usize) -> anyhow::Result<()> {
         }
     }
     let params = load_params(params_path.as_deref())?;
+    let sp = load_search_params(sp_path.as_deref(), &gates)?;
     let nnue = load_cli_nnue(eval, net_path.as_deref())?;
     let out = search_once(
         fen,
@@ -184,6 +203,7 @@ fn cmd_search(args: &[String], i: usize) -> anyhow::Result<()> {
         threads,
         hash,
         &params,
+        &sp,
         syzygy.as_deref(),
         nnue.as_ref(),
     )?;
@@ -229,16 +249,18 @@ fn load_cli_nnue(mode: EvalMode, path: Option<&str>) -> anyhow::Result<Option<Ar
 /// Runs one search to exactly `depth` plies and returns its `info ...` /
 /// `bestmove ...` transcript (the opening book is never consulted, so
 /// results are deterministic across machines).
+#[allow(clippy::too_many_arguments)]
 fn search_once(
     fen: &str,
     depth: i32,
     threads: usize,
     hash: usize,
     params: &EvalParams,
+    sp: &SearchParams,
     syzygy: Option<&str>,
     nnue: Option<&Arc<Network>>,
 ) -> anyhow::Result<String> {
-    Ok(search_once_with_result(fen, depth, threads, hash, params, syzygy, nnue)?.0)
+    Ok(search_once_with_result(fen, depth, threads, hash, params, sp, syzygy, nnue)?.0)
 }
 
 /// [`search_once`] plus the full [`SearchResult`] (instrumentation counters)
@@ -254,12 +276,14 @@ fn search_once(
 /// `nnue` is already-loaded weights, not a path: the bench loads once and
 /// searches four positions, and re-decoding the net per position would put
 /// loading inside the measured search time.
+#[allow(clippy::too_many_arguments)]
 fn search_once_with_result(
     fen: &str,
     depth: i32,
     threads: usize,
     hash: usize,
     params: &EvalParams,
+    sp: &SearchParams,
     syzygy: Option<&str>,
     nnue: Option<&Arc<Network>>,
 ) -> anyhow::Result<(String, Option<morstilia::search::SearchResult>)> {
@@ -277,6 +301,7 @@ fn search_once_with_result(
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let mut searcher = Searcher::with_params(hash, params.clone());
+    searcher.set_search_params(sp.clone());
     searcher.set_nnue(nnue.cloned());
     if let Some(path) = syzygy {
         // `--syzygy` is opt-in: without it no tables are loaded and the
@@ -360,6 +385,61 @@ fn cmd_export_params(args: &[String], i: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `--export-search-params FILE`: writes the built-in search parameters and
+/// feature gates as a TOML file.
+///
+/// Every ported Stockfish 19 mechanism is a *number* in that file and a
+/// *switch* in the `[gates]` table, so the export is the exact starting point
+/// for an SPSA run and a complete record of what "the defaults" are.
+fn cmd_export_search_params(args: &[String], i: usize) -> anyhow::Result<()> {
+    let path = args
+        .get(i + 1)
+        .filter(|f| !f.starts_with('-'))
+        .context("--export-search-params needs a file path")?;
+    let sp = SearchParams::default();
+    sp.save(path)
+        .with_context(|| format!("cannot export search params to {path:?}"))?;
+    println!("exported {} search params to {path}", sp.param_count());
+    println!("fingerprint {}", sp.fingerprint());
+    Ok(())
+}
+
+/// Parses one `--search-gate NAME=BOOL` value.
+fn parse_gate_arg(v: &str) -> anyhow::Result<(String, bool)> {
+    let (name, on) = v
+        .rsplit_once('=')
+        .with_context(|| format!("--search-gate needs NAME=BOOL, got {v:?}"))?;
+    let on = SearchGates::parse_gate_value(on)
+        .with_context(|| format!("--search-gate {name}: {on:?} is not a boolean"))?;
+    Ok((name.trim().to_string(), on))
+}
+
+/// Resolves `--search-params` + repeated `--search-gate` for a CLI command.
+///
+/// Same fatality contract as [`load_params`]: a tuned file a user explicitly
+/// asked for must either load or say why it did not. An unknown gate name is an
+/// error for the same reason — a typo that silently leaves the mechanism on is
+/// the one failure an A/B run cannot detect.
+fn load_search_params(
+    path: Option<&str>,
+    gates: &[(String, bool)],
+) -> anyhow::Result<SearchParams> {
+    let mut sp = match path {
+        None | Some("") => SearchParams::default(),
+        Some(p) => SearchParams::load(p)
+            .with_context(|| format!("cannot load search params from {p:?}"))?,
+    };
+    for (name, on) in gates {
+        if !sp.gates.set(name, *on) {
+            bail!(
+                "unknown search gate {name:?}; known gates: {}",
+                SearchGates::NAMES.join(", ")
+            );
+        }
+    }
+    Ok(sp)
+}
+
 /// Resolves an optional `--eval-params` CLI value: `None`/empty yields the
 /// baseline defaults; an explicit path must load cleanly (a CLI user who
 /// asks for a tuned file wants an error when it is wrong, unlike the UCI
@@ -386,6 +466,8 @@ fn cmd_bench(args: &[String], i: usize) -> anyhow::Result<()> {
     let mut syzygy: Option<String> = None;
     let mut eval = EvalMode::Nnue;
     let mut net_path: Option<String> = None;
+    let mut sp_path: Option<String> = None;
+    let mut gates: Vec<(String, bool)> = Vec::new();
     while j < args.len() {
         let flag = args[j].clone();
         if flag == "--stats" {
@@ -404,6 +486,8 @@ fn cmd_bench(args: &[String], i: usize) -> anyhow::Result<()> {
                 hash = v.parse().context("--hash must be an integer (MB)")?
             }
             Some(v) if flag == "--eval-params" => params_path = Some(v),
+            Some(v) if flag == "--search-params" => sp_path = Some(v),
+            Some(v) if flag == "--search-gate" => gates.push(parse_gate_arg(&v)?),
             Some(v) if flag == "--syzygy" => syzygy = Some(v),
             Some(v) if flag == "--eval" => {
                 eval = EvalMode::parse(&v)
@@ -414,6 +498,7 @@ fn cmd_bench(args: &[String], i: usize) -> anyhow::Result<()> {
         }
     }
     let params = load_params(params_path.as_deref())?;
+    let sp = load_search_params(sp_path.as_deref(), &gates)?;
     // Loaded once, before any searching, so the decode is not repeated per
     // position and never lands inside a reported search time.
     let nnue = load_cli_nnue(eval, net_path.as_deref())?;
@@ -435,8 +520,9 @@ fn cmd_bench(args: &[String], i: usize) -> anyhow::Result<()> {
     // Name the evaluator in the header: bench numbers are only comparable
     // within one evaluator, and the two are not on the same centipawn scale.
     println!(
-        "bench: depth {depth} threads {threads} hash {hash} MB eval {}{}",
+        "bench: depth {depth} threads {threads} hash {hash} MB eval {} searchparams {}{}",
         eval.as_str(),
+        sp.fingerprint(),
         syzygy
             .as_ref()
             .map_or(String::new(), |p| format!(" syzygy {p}")),
@@ -450,6 +536,7 @@ fn cmd_bench(args: &[String], i: usize) -> anyhow::Result<()> {
             threads,
             hash,
             &params,
+            &sp,
             syzygy.as_deref(),
             nnue.as_ref(),
         )?;
@@ -494,6 +581,22 @@ fn cmd_bench(args: &[String], i: usize) -> anyhow::Result<()> {
                 s.probcut_attempts,
                 s.total_pruned(),
                 r.ebf(),
+            );
+            println!(
+                "  singular cand {} test {} ext {} (1/2/3 = {}/{}/{}) multicut {} negext {} \
+                     iir {} hit {:.1}% mc {:.1}% ne {:.1}%",
+                s.singular_candidates,
+                s.singular_tests,
+                s.singular_extensions,
+                s.singular_ext_1,
+                s.singular_ext_2,
+                s.singular_ext_3,
+                s.singular_multicut,
+                s.singular_neg_extensions,
+                s.iir_reductions,
+                s.singular_hit_pct(),
+                s.singular_multicut_pct(),
+                s.singular_neg_ext_pct(),
             );
             if s.tb_probes > 0 {
                 println!(

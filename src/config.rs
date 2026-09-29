@@ -67,6 +67,17 @@ pub struct EngineConfig {
     /// Path to an evaluation-parameters TOML file; empty = baseline defaults.
     /// Loaded into the searcher at startup and on `setoption EvalParamsPath`.
     pub eval_params_path: String,
+    /// Path to a *search*-parameters TOML file; empty = the built-in
+    /// Stockfish-19-faithful defaults.
+    ///
+    /// Kept separate from [`EngineConfig::eval_params_path`] on purpose: the
+    /// evaluation parameters are frozen (the classical baseline is a
+    /// correctness contract for the NNUE ground-truth tests), while these drive
+    /// the singular/multi-cut/negative-extension margins, the modern LMR
+    /// formula, IIR and the pruning thresholds. Two files, two fingerprints,
+    /// and a match report can tell "the evaluator changed" apart from "the
+    /// search changed".
+    pub search_params_path: String,
     /// Which evaluator the search uses. Defaults to the classical one, so a
     /// missing or corrupt net can never stop the engine from playing.
     pub eval: EvalMode,
@@ -78,6 +89,12 @@ pub struct EngineConfig {
     pub ponder: bool,
     /// Print `info string` diagnostics to stderr instead of stdout.
     pub debug: bool,
+    /// The feature gates for the ported Stockfish 19 mechanisms.
+    ///
+    /// Defaults are all `true` (Stockfish-19-faithful). `setoption` addresses
+    /// an individual gate with the pseudo-option `SearchGate.<name>=<bool>`;
+    /// [`EngineConfig::gates_all_off`] is the pre-port search.
+    pub gates: crate::search::params::SearchGates,
 }
 
 impl Default for EngineConfig {
@@ -90,16 +107,46 @@ impl Default for EngineConfig {
             book_path: String::new(),
             syzygy_path: String::new(),
             eval_params_path: String::new(),
+            search_params_path: String::new(),
             eval: EvalMode::Nnue,
             nnue_path: String::new(),
             multi_pv: 1,
             ponder: false,
             debug: false,
+            gates: crate::search::params::SearchGates::default(),
         }
     }
 }
 
 impl EngineConfig {
+    /// Every ported mechanism switched off: the pre-port search.
+    ///
+    /// The `SearchGate.<name>=<bool>` pseudo-options build the same state one
+    /// gate at a time; this is the shortcut used by tests and by a documented
+    /// baseline comparison, and it exists so "the old engine" stays
+    /// expressible without a code change.
+    pub fn gates_all_off() -> EngineConfig {
+        EngineConfig {
+            gates: crate::search::params::SearchGates::all_off(),
+            ..EngineConfig::default()
+        }
+    }
+
+    /// A stable fingerprint of the gate set, for match reports and
+    /// configuration dumps. Two engines may only be compared when these match.
+    pub fn gates_fingerprint(&self) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(64);
+        for name in crate::search::params::SearchGates::NAMES {
+            let _ = write!(
+                s,
+                "{name}={};",
+                i32::from(self.gates.get(name).unwrap_or(false))
+            );
+        }
+        s
+    }
+
     /// Named UCI option → value. Unknown options are ignored (per UCI) and
     /// return `false`.
     pub fn set_option(&mut self, name: &str, value: Option<&str>) -> bool {
@@ -152,6 +199,32 @@ impl EngineConfig {
                     return true;
                 }
                 false
+            }
+            "SearchParamsPath" => {
+                if let Some(v) = value {
+                    self.search_params_path = v.to_string();
+                    return true;
+                }
+                false
+            }
+            // Every gate of `SearchGates` is addressable by name, so a single
+            // mechanism can be switched off from the GUI or from a match script
+            // without editing code. `SearchGates::NAMES` is the authoritative
+            // list; an unknown name is rejected rather than silently ignored,
+            // because a typo'd gate name that quietly does nothing is exactly
+            // the failure a match report cannot detect.
+            _ if value.is_some_and(|v| v.starts_with("SearchGate.")) => {
+                let name = value.unwrap_or_default();
+                let Some((gate, on)) = name
+                    .strip_prefix("SearchGate.")
+                    .and_then(|g| g.rsplit_once('='))
+                else {
+                    return false;
+                };
+                match crate::search::params::SearchGates::parse_gate_value(on) {
+                    Some(v) => self.gates.set(gate.trim(), v),
+                    None => false,
+                }
             }
             "Eval" => {
                 if let Some(v) = value.and_then(EvalMode::parse) {
@@ -222,6 +295,10 @@ impl EngineConfig {
             format!(
                 "option name EvalParamsPath type string default {}",
                 self.eval_params_path
+            ),
+            format!(
+                "option name SearchParamsPath type string default {}",
+                self.search_params_path
             ),
             format!(
                 "option name Eval type combo default {} {}",

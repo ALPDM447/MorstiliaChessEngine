@@ -1,6 +1,6 @@
 //! End-to-end tests for the engine-vs-engine match driver (Stage 8).
 //!
-//! These drive the compiled `morstilia-selfplay` binary as a subprocess:
+//! These drive the compiled `selfplay` binary as a subprocess:
 //! deterministic small matches, JSON match reports, resume continuation,
 //! baseline freezing and A-vs-B comparison — the same commands documented for
 //! the real baseline runs.
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_morstilia-selfplay")
+    env!("CARGO_BIN_EXE_selfplay")
 }
 
 /// Runs the CLI with `args`, asserting a zero exit, and returns stdout.

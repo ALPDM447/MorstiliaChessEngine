@@ -24,7 +24,15 @@ pub const INFINITE: i32 = 32001;
 pub const DRAW: i32 = 0;
 
 /// Number of ulps from `MATE` inside which a score is treated as a mate score.
-const MATE_THRESHOLD: i32 = 8000;
+pub const MATE_THRESHOLD: i32 = 8000;
+
+/// The largest magnitude a *static* evaluation may have and still be
+/// distinguishable from a forced mate — `|score| >= |this|` means "mate".
+///
+/// The correction history (and any other learned adjustment) must clamp against
+/// this bound, not against [`MATE`] itself: clamping to just inside the table
+/// would still leave scores that every mate test in the search reads as mates.
+pub const MAX_NON_MATE: i32 = MATE - MATE_THRESHOLD;
 
 #[inline]
 pub const fn mate_in(ply: i32) -> i32 {
