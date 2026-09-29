@@ -466,6 +466,9 @@ pub fn spsa_search_with_callback(
     let mut theta = base_vec.clone();
     let mut best = theta.clone();
     let mut best_loss = loss_before;
+    // The loss of the current iterate; the last iteration already measured
+    // it, so the report reuses it instead of paying for another gauntlet.
+    let mut loss_final = loss_before;
     let mut samples = vec![(0usize, loss_before)];
     let mut pairs: Vec<(f64, f64)> = Vec::with_capacity(cfg.iterations);
 
@@ -525,6 +528,7 @@ pub fn spsa_search_with_callback(
         let mut sp_cur = base.clone();
         sp_cur.from_vec(&theta);
         let l_cur = objective.loss(&sp_cur, k)?;
+        loss_final = l_cur;
         if l_cur < best_loss {
             best_loss = l_cur;
             best = theta.clone();
@@ -546,7 +550,7 @@ pub fn spsa_search_with_callback(
     Ok(SearchTuneReport {
         loss_before,
         loss_best: best_loss,
-        loss_final: objective.loss(&sp_final, cfg.iterations)?,
+        loss_final,
         best_params: best,
         final_params: theta,
         best: sp_best,

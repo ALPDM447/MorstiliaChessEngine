@@ -213,11 +213,13 @@ impl EngineConfig {
             // list; an unknown name is rejected rather than silently ignored,
             // because a typo'd gate name that quietly does nothing is exactly
             // the failure a match report cannot detect.
-            _ if value.is_some_and(|v| v.starts_with("SearchGate.")) => {
-                let name = value.unwrap_or_default();
-                let Some((gate, on)) = name
-                    .strip_prefix("SearchGate.")
-                    .and_then(|g| g.rsplit_once('='))
+            _ if name.starts_with("SearchGate.") => {
+                // Accept both `name SearchGate.x=false` and
+                // `name SearchGate.x value false`.
+                let spec = name.strip_prefix("SearchGate.").unwrap_or_default();
+                let Some((gate, on)) = spec
+                    .rsplit_once('=')
+                    .or_else(|| value.map(|v| (spec, v)))
                 else {
                     return false;
                 };

@@ -49,11 +49,8 @@ pub fn see(board: &Board, m: RawMove, p: &EvalParams) -> i32 {
         return 0; // king captures are quiet by convention here
     }
 
-    // SEE is only meaningful for captures and promotions.
-    let is_capture = m.is_en_passant() || board.role_at(to).is_some();
-    if !is_capture && promo.is_none() {
-        return 0;
-    }
+    // Quiet moves are evaluated too (victim 0): the search's quiet SEE
+    // pruning relies on seeing that the moved piece hangs on `to`.
 
     // Occupancy used for the x-ray scans: the mover leaves its origin and the
     // captured victim leaves its square, so sliders see through afterwards.
@@ -114,6 +111,18 @@ pub fn see(board: &Board, m: RawMove, p: &EvalParams) -> i32 {
         };
 
         let sq_bb = Bitboard::from_square(sq);
+
+        // A king may only recapture when the other side has no attacker left
+        // on the square; otherwise the capture is illegal. Kings are worth 0
+        // here, so letting one "recapture" into a defended square would make
+        // the exchange look profitable for the wrong side.
+        if role == Role::King {
+            let them = board.by_color(!stm);
+            let remaining = (attackers & !sq_bb) | (attacks_to(board, to, occ ^ sq_bb) & occ);
+            if !(remaining & them).is_empty() {
+                break;
+            }
+        }
 
         // The attacker leaves its current square.
         occ ^= sq_bb;

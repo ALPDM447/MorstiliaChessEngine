@@ -652,12 +652,9 @@ impl SearchThread {
             Some(Some(ctx)) => ctx,
             _ => return false,
         };
-        // Check the A->B, B->A pattern: move two ago went to -> from,
-        // move four ago went from -> to.
-        two_ago.to == m.to()
-            && two_ago.from == m.from()
-            && four_ago.to == m.from()
-            && four_ago.from == m.to()
+        // Stockfish's pattern: this move starts where our previous move
+        // landed, and that move started where the one before it landed.
+        m.from() == two_ago.to && two_ago.from == four_ago.to
     }
 }
 

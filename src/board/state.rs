@@ -71,8 +71,10 @@ pub struct MaterialKeys {
 /// table is generated from a fixed-seed SplitMix64 instead of shipping 384
 /// magic numbers. `LazyLock` keeps it out of the hot path: the table is built
 /// once, then every lookup is a plain array read.
-static MATERIAL_ZOBRIST: std::sync::LazyLock<[[u64; 64]; 7]> = std::sync::LazyLock::new(|| {
-    let mut table = [[0u64; 64]; 7];
+// Indexed by colour too: a white and a black pawn on the same square are
+// different structures and must not share a key.
+static MATERIAL_ZOBRIST: std::sync::LazyLock<[[u64; 64]; 14]> = std::sync::LazyLock::new(|| {
+    let mut table = [[0u64; 64]; 14];
     let mut state = 0x5DEE_CE66_0B1C_2F35u64;
     for role in table.iter_mut() {
         for key in role.iter_mut() {
@@ -90,8 +92,8 @@ static MATERIAL_ZOBRIST: std::sync::LazyLock<[[u64; 64]; 7]> = std::sync::LazyLo
 
 /// The key for `role` standing on `square`.
 #[inline]
-fn piece_key(role: Role, square: Square) -> u64 {
-    MATERIAL_ZOBRIST[role as usize][square.to_usize()]
+fn piece_key(role: Role, color: Color, square: Square) -> u64 {
+    MATERIAL_ZOBRIST[color as usize * 7 + role as usize][square.to_usize()]
 }
 
 impl MaterialKeys {
@@ -103,7 +105,7 @@ impl MaterialKeys {
             let Some(piece) = board.piece_at(sq) else {
                 continue;
             };
-            let k = piece_key(piece.role, sq);
+            let k = piece_key(piece.role, piece.color, sq);
             match piece.role {
                 Role::Pawn => keys.pawn ^= k,
                 Role::Knight | Role::Bishop => {
@@ -123,7 +125,7 @@ impl MaterialKeys {
     /// moving piece's origin).
     #[inline]
     fn remove(&mut self, role: Role, color: Color, square: Square) {
-        let k = piece_key(role, square);
+        let k = piece_key(role, color, square);
         match role {
             Role::Pawn => self.pawn ^= k,
             Role::Knight | Role::Bishop => {
@@ -168,7 +170,7 @@ impl MaterialKeys {
     /// Places a piece on the keys.
     #[inline]
     fn add(&mut self, role: Role, color: Color, square: Square) {
-        let k = piece_key(role, square);
+        let k = piece_key(role, color, square);
         match role {
             Role::Pawn => self.pawn ^= k,
             Role::Knight | Role::Bishop => {
