@@ -399,26 +399,51 @@ mod tests {
         .unwrap()
     }
 
+    /// A configuration whose games reach a *real* result, so the run actually
+    /// produces samples.
+    ///
+    /// [`gen_config`] asks for a 60-ply cap, which depth-4 games do not finish
+    /// inside: two games in three hit the cap, and a cap draw is **excluded**
+    /// from the dataset by design (see the module docs). A test whose point is
+    /// something about the samples cannot use that configuration — it would be
+    /// asserting on a coin flip, and would silently assert nothing at all when
+    /// the flip came up wrong.
+    ///
+    /// Weak, fast players here, and the same ply cap the shipped
+    /// `GenerationConfig` uses, so the games end by mate or by repetition well
+    /// inside it.
+    fn sample_config(games: usize) -> GenerationConfig {
+        let mut c = gen_config(games);
+        c.depth = 2;
+        c.max_plies = 240;
+        c
+    }
+
     #[test]
     fn generation_is_deterministic_for_a_seed() {
-        let a = generator(gen_config(3)).run(&mut |_, _| {}).unwrap();
-        let b = generator(gen_config(3)).run(&mut |_, _| {}).unwrap();
+        let a = generator(sample_config(3)).run(&mut |_, _| {}).unwrap();
+        let b = generator(sample_config(3)).run(&mut |_, _| {}).unwrap();
         assert_eq!(a.samples(), b.samples());
         assert!(!a.is_empty(), "three shallow games must yield samples");
     }
 
     #[test]
     fn a_different_seed_plays_different_games() {
-        let a = generator(gen_config(2)).run(&mut |_, _| {}).unwrap();
-        let mut cfg = gen_config(2);
-        cfg.seed = 999;
-        let b = generator(cfg).run(&mut |_, _| {}).unwrap();
+        let a = generator(sample_config(2)).run(&mut |_, _| {}).unwrap();
+
+        let mut cfg_b = sample_config(2);
+        cfg_b.seed = 999;
+
+        let b = generator(cfg_b).run(&mut |_, _| {}).unwrap();
+
+        assert!(!a.is_empty(), "seed 12345 produced no samples");
+        assert!(!b.is_empty(), "seed 999 produced no samples");
         assert_ne!(a.samples(), b.samples());
     }
 
     #[test]
     fn every_sample_is_labelled_from_the_side_to_move() {
-        let ds = generator(gen_config(3)).run(&mut |_, _| {}).unwrap();
+        let ds = generator(sample_config(3)).run(&mut |_, _| {}).unwrap();
         let (w, d, l) = ds.wdl();
         assert!(w + d + l == ds.len());
         // White's wins must be mirrored by Black's losses, because every
@@ -436,15 +461,27 @@ mod tests {
 
     #[test]
     fn every_sample_replays_and_carries_a_legal_pv() {
-        let ds = generator(gen_config(2)).run(&mut |_, _| {}).unwrap();
-        let with_pv = ds.samples().iter().filter(|s| !s.pv.is_empty()).count();
-        assert!(with_pv > 0, "no sample carried a teacher PV");
+        let mut g = generator(sample_config(2));
+        let ds = g.run(&mut |_, _| {}).unwrap();
+        // Precondition, checked separately: an all-cap-draw run is legal and
+        // produces no samples, so this must not be reported as a missing PV.
+        assert!(
+            !ds.is_empty(),
+            "the run produced no samples at all:\n{}",
+            g.report().summary()
+        );
         for s in ds.samples() {
-            // The FEN parses, and the PV is legal in it.
+            // The FEN parses, the position is one a move can be taught from,
+            // and the PV is present and legal in it.
             let pos = s.position().unwrap();
             assert!(
                 !pos.legal_moves().is_empty(),
                 "a terminal position was sampled"
+            );
+            assert!(
+                !s.pv.is_empty(),
+                "a non-terminal position was sampled with no teacher PV: {}",
+                s.fen
             );
             assert_eq!(
                 s.legal_pv().unwrap().len(),
@@ -457,13 +494,21 @@ mod tests {
 
     #[test]
     fn the_filters_are_reported() {
-        let mut cfg = gen_config(3);
+        // `sample_config`, not `gen_config`: the filters only get a chance to
+        // fire on a game that reached a real result, and a game the ply cap
+        // decided is skipped before any position is looked at.
+        let mut cfg = sample_config(3);
         // A piece count nothing can satisfy: everything is dropped, and the
         // reason is visible rather than the dataset being mysteriously empty.
         cfg.min_pieces = 64;
         let mut g = generator(cfg);
         let ds = g.run(&mut |_, _| {}).unwrap();
         assert!(ds.is_empty());
+        assert!(
+            g.report().cap_draws < g.report().games,
+            "every game was a cap draw, so no position was ever filtered: {}",
+            g.report().summary()
+        );
         assert!(g.report().dropped_for("too few pieces") > 0);
         assert!(g.report().summary().contains("too few pieces"));
     }

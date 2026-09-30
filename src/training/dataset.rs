@@ -483,7 +483,7 @@ mod tests {
     "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1";
 
     fn sample() -> Sample {
-    Sample::new(Label::Win, MID, vec!["Bg5".into(), "Ne7".into()])
+    Sample::new(Label::Win, MID, vec!["e5".into(), "Nf3".into()])
     }
 
     #[test]
@@ -623,11 +623,15 @@ mod tests {
 
     #[test]
     fn the_pv_is_replayed_and_truncates_rather_than_erroring() {
-        let s = Sample::new(Label::Win, MID, vec!["e7e5".into(), "g1f3".into()]);
+        let s = Sample::new(Label::Win, MID, vec!["e5".into(), "Nf3".into()]);
         assert_eq!(s.legal_pv().unwrap(), s.pv);
 
-        let bad = Sample::new(Label::Win, MID, vec!["e7e5".into(), "a1a8".into()]);
-        assert_eq!(bad.legal_pv().unwrap(), vec!["e7e5".to_string()]);
+        let bad = Sample::new(
+            Label::Win,
+            MID,
+            vec!["e5".into(), "NOT-A-MOVE".into()],
+        );
+        assert_eq!(bad.legal_pv().unwrap(), vec!["e5".to_string()]);    
 
         assert!(
             Sample::without_pv(Label::Win, MID)

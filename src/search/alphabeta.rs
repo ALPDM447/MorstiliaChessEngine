@@ -399,13 +399,23 @@ pub fn alphabeta(
     // SF19 capture-driven ProbCut, falling back to the old static ProbCut when
     // its gate is disabled.
     //
-    // Unlike the node-level razor and the reverse futility above, ProbCut is
-    // **not** restricted to non-check nodes: Stockfish's ProbCut block carries
-    // no `inCheck` term, and a check node is precisely where the capture list
-    // is non-trivial (capturing the checker). A probe that proves such a capture
-    // is a genuine fail-high for the node, so the return stays sound; keeping
-    // the node out of reach would simply leave the mechanism with no candidates
-    // in sharp positions.
+    // Faithful to SF19's Step 12 in three places that matter:
+    //
+    // * The candidate set is `MoveList<CAPTURES>` filtered by
+    //   `see_ge(m, probCutBeta - ss->staticEval)`. The probe therefore only
+    //   looks at captures that actually gain enough to reach the raised beta.
+    // * The TT term skips a node whose stored value is already *below*
+    //   `probCutBeta` — such a node cannot fail high, so probing it is waste.
+    //   (The previous `tt_value >= prob_cut_beta` test had this inverted: it
+    //   skipped exactly the nodes where a probe pays off.)
+    // * The reduced search only runs when `probCutDepth > 0`; otherwise the
+    //   quiescence value alone decides, instead of re-entering alpha-beta with
+    //   a non-positive depth.
+    //
+    // `!in_check` matches SF19 too: its ProbCut block carries no `inCheck`
+    // term because control has already jumped past it — `if (ss->inCheck)
+    // goto moves_loop;` precedes Step 12, and the ProbCut move picker asserts
+    // `!pos.checkers()`.
     // ---------------------------------------------------------------------
     if gates.sf19_probcut {
         let prob_beta =
@@ -417,15 +427,15 @@ pub fn alphabeta(
                 sp.probcut_probe_depth_stagnant
             };
 
-        let tt_already_proves = tt_value
-            .is_some_and(|v| tt_entry.is_some_and(|e| e.depth >= prob_depth) && v >= prob_beta);
+        let tt_refutes = tt_value.is_some_and(|v| v < prob_beta);
 
         if !pv_node
+            && !in_check
             && allow_null
             && depth >= sp.probcut_min_depth
             && !singular::is_decisive(beta)
             && prob_beta < crate::search::MATE_ZONE
-            && !tt_already_proves
+            && !tt_refutes
             && pruning::side_has_attacking_pieces(pos.board(), pos.turn())
         {
             thread.stats.probcut_attempts += 1;
@@ -441,9 +451,14 @@ pub fn alphabeta(
                 &shared.params,
             );
 
+            let see_threshold = prob_beta - static_eval;
+
             for i in 0..captures.len() {
                 let m = captures.get(i);
                 if excluded_move == Some(m) {
+                    continue;
+                }
+                if see::see(pos.board(), m, &shared.params) < see_threshold {
                     continue;
                 }
                 let child = thread.make_child(pos, m, shared, ply + 1);
@@ -470,19 +485,23 @@ pub fn alphabeta(
                     continue;
                 }
 
-                thread.prior_reduction[ply + 1] = 0;
-                let value = -alphabeta(
-                    &child,
-                    -prob_beta,
-                    -prob_beta + 1,
-                    prob_depth,
-                    ply + 1,
-                    shared,
-                    thread,
-                    history,
-                    !cut_node,
-                    !cut_node,
-                );
+                let value = if prob_depth > 0 {
+                    thread.prior_reduction[ply + 1] = 0;
+                    -alphabeta(
+                        &child,
+                        -prob_beta,
+                        -prob_beta + 1,
+                        prob_depth,
+                        ply + 1,
+                        shared,
+                        thread,
+                        history,
+                        !cut_node,
+                        !cut_node,
+                    )
+                } else {
+                    qv
+                };
                 if thread.stopped {
                     return 0;
                 }
@@ -1648,7 +1667,11 @@ mod tests {
 
     #[test]
     fn probcut_fires_and_keeps_the_win() {
-        let fen = "6k1/8/8/8/8/8/5q2/5Q1K w - - 0 1";
+        // Black's queen on f2 hangs to the white queen, and the black knight on
+        // f3 gives the tree the captures that SF19's capture-driven ProbCut
+        // needs: with bare `KQ vs K` after Qxf2 the position has no capture at
+        // all, so a faithful ProbCut can never cut there.
+        let fen = "6k1/8/8/8/8/5n2/5q2/5Q1K w - - 0 1";
         let r = search_depth(fen, 8);
 
         assert!(
