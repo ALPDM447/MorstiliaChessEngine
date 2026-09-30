@@ -40,6 +40,7 @@ use crate::search::params::SearchParams;
 use crate::search::{Searcher, TimeLimit};
 use crate::training::config::{Label, TeacherConfig, TeacherKind};
 use crate::training::dataset::Sample;
+use crate::types::RawMove;
 
 /// A depth-limited, single-threaded searcher used as a teacher.
 ///
@@ -212,13 +213,19 @@ impl Teacher {
             infinite: true,
         };
         let r = self.searcher.search(pos, &[], &limits, &self.stop, 1, &[]);
+        Self::pv_to_san(pos, &r.pv)
+    }
+
+    /// Renders a search PV as SAN, stopping at the first move that does not
+    /// replay.
+    fn pv_to_san(pos: &Position, pv: &[RawMove]) -> Vec<String> {
         // Replaying the PV through the position is the only trustworthy way to
         // render it: the `RawMove`s are relative to nodes the caller cannot see,
         // and a SAN that does not parse in the position it claims is worse than
         // no PV at all.
         let mut at = pos.clone();
-        let mut out = Vec::with_capacity(r.pv.len());
-        for m in r.pv {
+        let mut out = Vec::with_capacity(pv.len());
+        for &m in pv {
             match at.play_san(&at.san_of(m)) {
                 Ok((child, _)) => {
                     out.push(at.san_of(m));
@@ -296,16 +303,11 @@ impl Teacher {
         // 3. A decisive score is a *proved* result, not a huge centipawn
         //    preference, and it is labelled as such.
         let decisive = is_decisive(raw);
-        let pv = if self.kind.supplies_pv() && r.pv.len() == 1 {
-            let m = r.pv[0];
-            vec![pos.san_of(m)]
+        // The PV of the search that produced the score, not a second search.
+        let pv = if self.kind.supplies_pv() {
+            Self::pv_to_san(pos, &r.pv)
         } else {
             Vec::new()
-        };
-        let pv = if pv.is_empty() && self.kind.supplies_pv() {
-            self.pv(pos)
-        } else {
-            pv
         };
 
         let label = if decisive && self.fold_decisive {
@@ -315,7 +317,7 @@ impl Teacher {
             // that carries it unambiguously. The score keeps its magnitude as a
             // weight.
             if raw > 0 { Label::Win } else { Label::Loss }
-        } else if raw.abs() * 2 < self.max_score_cp / 3 {
+        } else if raw.abs() < self.max_score_cp / 3 {
             // Inside the noise floor. A position the teacher cannot tell apart
             // is a *draw* as far as the dataset is concerned, and labelling it
             // ±20 cp teaches a student to fit noise.

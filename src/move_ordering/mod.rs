@@ -168,7 +168,9 @@ pub fn order_moves_ctx(
     for (i, slot) in keyed.iter_mut().enumerate().take(n) {
         let m = moves.get(i);
         let mut key = score_move(pos, m, tt_move, tables, ply, prev, ant, p);
-        if key >= tt_move::CAPTURE_TIER && key < tt_move::KILLER2_TIER && see::see(board, m, p) < 0
+        // Capture tier: above the killers (the capture-history adjustment can
+        // dip a key slightly under `CAPTURE_TIER`) and below the TT move.
+        if key > tt_move::KILLER1_TIER && key < tt_move::TT_TIER && see::see(board, m, p) < 0
         {
             key = tt_move::BAD_CAPTURE_TIER + capture_score(board, m, p);
         }

@@ -228,7 +228,9 @@ impl UciEngine {
                     s.params = Arc::new(params);
                 }
             }
-            "SearchParamsPath" | _ if name.starts_with("SearchGate.") => {
+            // The guard binds to the whole pattern, so `"SearchParamsPath" | _
+            // if ...` would never match `SearchParamsPath` itself.
+            _ if name == "SearchParamsPath" || name.starts_with("SearchGate.") => {
                 // Search parameters and feature gates. Applied through the same
                 // path so a mid-game change is visible to the very next search.
                 // The table is *not* flushed: a bound stored under the old

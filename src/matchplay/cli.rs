@@ -416,6 +416,8 @@ fn run(args: &[String]) -> anyhow::Result<()> {
         net_path.as_deref(),
         white_net.as_deref(),
         black_net.as_deref(),
+        white_eval == EngineEvaluator::Nnue,
+        black_eval == EngineEvaluator::Nnue,
     )?;
     if (white_eval == EngineEvaluator::Nnue) != (white_net.is_some())
         || (black_eval == EngineEvaluator::Nnue) != (black_net.is_some())
@@ -788,24 +790,28 @@ fn load_net(path: Option<&str>) -> anyhow::Result<Arc<crate::nnue::network::Netw
 /// Two different paths means two different weight sets, and a search-parameter
 /// A/B across them is not an A/B at all — so the mismatch is reported on stderr
 /// rather than being quietly accepted. `None` means no side wants a net.
+///
+/// A side that evaluates with NNUE but names no file gets the embedded net;
+/// a classical side gets none.
 fn load_nets(
     common: Option<&str>,
     white: Option<&str>,
     black: Option<&str>,
+    white_nnue: bool,
+    black_nnue: bool,
 ) -> anyhow::Result<(
     Option<Arc<crate::nnue::network::Network>>,
     Option<Arc<crate::nnue::network::Network>>,
 )> {
     let white_path = white.or(common);
     let black_path = black.or(common);
-    if white_path.is_none() && black_path.is_none() {
-        return Ok((None, None));
-    }
-    if white_path == black_path {
+    if white_nnue && black_nnue && white_path == black_path {
         let net = load_net(white_path)?;
         return Ok((Some(Arc::clone(&net)), Some(net)));
     }
-    Ok((Some(load_net(white_path)?), Some(load_net(black_path)?)))
+    let white_net = if white_nnue { Some(load_net(white_path)?) } else { None };
+    let black_net = if black_nnue { Some(load_net(black_path)?) } else { None };
+    Ok((white_net, black_net))
 }
 
 /// Resolves a search-parameter file plus the gates requested on the command

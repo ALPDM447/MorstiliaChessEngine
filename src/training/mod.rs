@@ -122,6 +122,12 @@ impl Run {
             }
             tb
         };
+        if config.teacher.kind == TeacherKind::Tablebase && !syzygy.is_loaded() {
+            anyhow::bail!(
+                "a tablebase teacher needs loaded Syzygy tables; set SyzygyPath (syzygy_path) \
+                 to a directory that holds them"
+            );
+        }
         Ok(Run {
             config,
             teacher_net,

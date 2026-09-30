@@ -28,7 +28,7 @@
 //! Morstilia cannot represent a Stockfish concept exactly, the deviation is
 //! named in the doc comment on the item that needs it.
 
-use crate::endgame::TB_WIN;
+use crate::endgame::{TB_CURSED, TB_WIN};
 use crate::search::MATE_ZONE;
 use crate::search::params::SearchParams;
 use crate::tt::Bound;
@@ -83,7 +83,9 @@ pub const fn is_loss(value: i32) -> bool {
 #[inline]
 pub const fn is_decisive(value: i32) -> bool {
     let v = if value < 0 { -value } else { value };
-    v >= MATE_ZONE || v >= TB_WIN_IN_MAX_PLY
+    // `TB_CURSED` is the weakest tablebase score, so this covers both the
+    // honest and the cursed tablebase bands as well as mates.
+    v >= MATE_ZONE || v >= TB_CURSED
 }
 
 /// Every fact the singular decision needs, snapshotted at the candidate move.
@@ -419,6 +421,9 @@ pub fn multicut_correction_bonus(ctx: &SingularCtx<'_>, value: i32) -> i32 {
 pub fn tt_move_history_shift(current: i32, bonus: i32, limit: i32) -> i32 {
     let limit = limit.max(1);
     let bonus = bonus.clamp(-limit, limit);
+    // An out-of-band `current` (e.g. after the limit was lowered) would
+    // otherwise be pushed further out instead of back inside the band.
+    let current = current.clamp(-limit, limit);
     current + bonus - current * bonus.abs() / limit
 }
 

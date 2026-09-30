@@ -444,8 +444,8 @@ search_tunables! {
     // is the only thing that changes the search.
     // ---------------------------------------------------------------------
 
-    /// `staticEval >= beta - nmpMarginBase - nmpMarginDepth * depth
-    ///  - nmpMarginImproving * improving + nmpMarginOffset` (search.cpp:1011).
+    /// `staticEval >= beta + nmpMarginBase - nmpMarginDepth * depth
+    ///  - nmpMarginImproving * improving` (search.cpp:1011).
     nmp_margin_base: i32 = 365, -4096, 8192;
     /// Depth coefficient of the null-move margin.
     nmp_margin_depth: i32 = 13, 0, 512;
