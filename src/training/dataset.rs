@@ -134,6 +134,7 @@ impl Sample {
         }
         let mut pos = self.position()?;
         let mut out = Vec::with_capacity(self.pv.len());
+
         for san in &self.pv {
             match pos.play_san(san) {
                 Ok((child, _)) => {
@@ -143,6 +144,7 @@ impl Sample {
                 Err(_) => break,
             }
         }
+
         Ok(out)
     }
 }
@@ -477,10 +479,11 @@ impl Dataset {
 mod tests {
     use super::*;
 
-    const MID: &str = "r1bq1rk1/ppp2ppp/2n5/3p4/3P4/2P5/PP1B1PPP/RNBQ1RK1 w - - 0 8";
+    const MID: &str =
+    "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1";
 
     fn sample() -> Sample {
-        Sample::new(Label::Win, MID, vec!["c1g5".into(), "d8g8".into()])
+    Sample::new(Label::Win, MID, vec!["Bg5".into(), "Ne7".into()])
     }
 
     #[test]
@@ -620,14 +623,11 @@ mod tests {
 
     #[test]
     fn the_pv_is_replayed_and_truncates_rather_than_erroring() {
-        let s = Sample::new(Label::Win, MID, vec!["c1g5".into(), "d8g8".into()]);
+        let s = Sample::new(Label::Win, MID, vec!["e7e5".into(), "g1f3".into()]);
         assert_eq!(s.legal_pv().unwrap(), s.pv);
 
-        // A second, illegal move truncates the line and returns the legal
-        // prefix — a teacher PV that ran into an unrecorded repetition is
-        // truncated evidence, not a corrupt dataset.
-        let bad = Sample::new(Label::Win, MID, vec!["c1g5".into(), "a1a8".into()]);
-        assert_eq!(bad.legal_pv().unwrap(), vec!["c1g5".to_string()]);
+        let bad = Sample::new(Label::Win, MID, vec!["e7e5".into(), "a1a8".into()]);
+        assert_eq!(bad.legal_pv().unwrap(), vec!["e7e5".to_string()]);
 
         assert!(
             Sample::without_pv(Label::Win, MID)
@@ -666,7 +666,7 @@ mod tests {
         trunc.push(Sample::new(
             Label::Win,
             MID,
-            vec!["c1g5".into(), "not-a-move".into()],
+            vec!["e7e5".into(), "not-a-move".into()],
         ));
         assert_eq!(trunc.validate().truncated_pvs, 1);
     }

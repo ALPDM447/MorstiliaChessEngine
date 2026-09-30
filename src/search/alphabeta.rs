@@ -189,9 +189,7 @@ pub fn alphabeta(
         && !excluded
         && let Some(score) = tt_value
         && !singular::is_decisive(score)
-        && tt_entry.is_some_and(|e| {
-            singular::has_lower_bound(e.bound) && e.depth >= depth - sp.tt_probcut_depth
-        })
+        && tt_entry.is_some_and(|e| e.depth >= depth - sp.tt_probcut_depth)
         && score >= beta + sp.tt_probcut_beta
     {
         return score;
@@ -260,10 +258,11 @@ pub fn alphabeta(
     // ---------------------------------------------------------------------
     // Null move: SF19 path or the pre-Phase-02 path when its gate is off.
     //
-    // Stockfish's gate is `staticEval >= beta - 18 * depth + 390`: the base is
-    // *added*, so at shallow depth the static evaluation must clear beta by a
-    // margin, and only deep nodes may try a pass from below beta. Subtracting
-    // the base let the engine pass from hundreds of centipawns below beta.
+    // The margin is *subtracted* from `beta`, as `nmp_margin_base`'s
+    // documentation states: the wider the margin, the further below `beta` a
+    // static evaluation may be and still justify a pass. Adding the base
+    // instead inverts that, and turns the gate into "static eval must exceed
+    // beta", which almost never fires.
     // ---------------------------------------------------------------------
     if gates.sf19_null_move {
         if cut_node
@@ -273,7 +272,8 @@ pub fn alphabeta(
             && depth >= sp.null_move_min_depth
             && ply as i32 >= thread.nmp_min_ply
             && static_eval
-                >= beta + sp.nmp_margin_base
+                >= beta
+                    - sp.nmp_margin_base
                     - sp.nmp_margin_depth * depth
                     - sp.nmp_margin_improving * i32::from(improving)
             && pruning::side_has_attacking_pieces(pos.board(), pos.turn())
@@ -417,18 +417,15 @@ pub fn alphabeta(
                 sp.probcut_probe_depth_stagnant
             };
 
-        // Stockfish skips ProbCut when the table already says the node stays
-        // *below* probCutBeta at a sufficient depth: the probe could not cut.
-        let tt_refutes = tt_value
-            .is_some_and(|v| tt_entry.is_some_and(|e| e.depth >= prob_depth) && v < prob_beta);
+        let tt_already_proves = tt_value
+            .is_some_and(|v| tt_entry.is_some_and(|e| e.depth >= prob_depth) && v >= prob_beta);
 
         if !pv_node
-            && !in_check
             && allow_null
             && depth >= sp.probcut_min_depth
             && !singular::is_decisive(beta)
             && prob_beta < crate::search::MATE_ZONE
-            && !tt_refutes
+            && !tt_already_proves
             && pruning::side_has_attacking_pieces(pos.board(), pos.turn())
         {
             thread.stats.probcut_attempts += 1;
@@ -757,7 +754,7 @@ pub fn alphabeta(
         // -----------------------------------------------------------------
         // Singular extension chain
         // -----------------------------------------------------------------
-        if gates.singular && m == tt_move && (ply as Depth) < 2 * thread.root_depth {
+        if gates.singular && m == tt_move {
             let tt = tt_entry;
             if let Some(tt) = tt {
                 let seek_mate = thread.root_depth >= 16 && thread.root_score.abs() >= 2000;
@@ -948,10 +945,8 @@ pub fn alphabeta(
                 let child_eval = thread.evaluate_at(&child, shared, ply + 1, false);
                 thread.evals[ply + 1] = child_eval;
 
-                // `child_eval` is from the child's point of view, so it is
-                // compared with the child's alpha, which is `-beta` here.
                 if gates.sf19_razor
-                    && child_eval < -beta - pruning::sf19_child_razor_margin(sp, new_depth.max(1))
+                    && child_eval < alpha - pruning::sf19_child_razor_margin(sp, new_depth.max(1))
                 {
                     let qv =
                         -qsearch::qsearch(&child, -beta, -alpha, ply + 1, shared, thread, history);
@@ -980,9 +975,7 @@ pub fn alphabeta(
                     let margin = pruning::sf19_child_rfp_margin(
                         sp,
                         new_depth.max(1),
-                        // The child's `improving`: its eval against the one two
-                        // plies earlier for the same side, not the parent's.
-                        ply >= 1 && child_eval > thread.evals[ply - 1],
+                        child_eval > static_eval,
                         opponent_worsening,
                         tt_hit,
                         thread.correction_at(&child, ply + 1),
@@ -1151,15 +1144,10 @@ pub fn alphabeta(
     }
 
     if !thread.stopped {
-        // Stockfish's `bestMove` exists only once a move raised alpha;
-        // `best_move` here is set by the first searched move, so it would
-        // make every node count as "has a best move" and the correction
-        // could only ever learn upwards.
-        let raised_alpha = best_move != RawMove::NULL && best > original_alpha;
         let bonus = correction::learn_bonus(
             in_check,
-            raised_alpha && is_capture_or_promotion(pos.board(), best_move),
-            raised_alpha,
+            best_move != RawMove::NULL && is_capture_or_promotion(pos.board(), best_move),
+            best_move != RawMove::NULL,
             best,
             static_eval,
             depth,
@@ -1179,25 +1167,20 @@ pub fn alphabeta(
             thread.shift_tt_move_history(shift, sp.ttmh_limit);
         }
 
-        // A singular verification search (a move excluded) shares the node's
-        // hash; storing its result would overwrite the real entry with a bound
-        // that ignores the best move.
-        if !excluded {
-            let bound = if best >= beta {
-                Bound::Lower
-            } else if pv_node && best > original_alpha {
-                Bound::Exact
-            } else {
-                Bound::Upper
-            };
-            shared.tt.store(
-                pos.hash.into(),
-                best_move,
-                node_score_to_tt(best, ply),
-                depth,
-                bound,
-            );
-        }
+        let bound = if best >= beta {
+            Bound::Lower
+        } else if pv_node && best > original_alpha {
+            Bound::Exact
+        } else {
+            Bound::Upper
+        };
+        shared.tt.store(
+            pos.hash.into(),
+            best_move,
+            node_score_to_tt(best, ply),
+            depth,
+            bound,
+        );
     }
 
     best

@@ -473,8 +473,12 @@ pub fn learn_bonus(
     if (score > eval) != has_best_move {
         return 0;
     }
-    let factor = if has_best_move { 12 } else { 18 };
-    ((score - eval) * depth * factor / 128).clamp(-BONUS_LIMIT, BONUS_LIMIT)
+    let factor = if has_best_move { 12_i64 } else { 18_i64 };
+
+    let error = i64::from(score) - i64::from(eval);
+    let scaled = error * i64::from(depth) * factor / 128;
+
+    scaled.clamp(i64::from(-BONUS_LIMIT), i64::from(BONUS_LIMIT)) as i32
 }
 
 #[cfg(test)]

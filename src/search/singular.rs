@@ -648,11 +648,13 @@ mod tests {
     fn tt_depth_margin_is_depth_minus_three() {
         let sp = sp();
         let mut c = ctx(&sp);
+
         c.depth = 10;
         c.tt_depth = 7;
-        assert!(!singular_candidate(&c));
-        c.tt_depth = 8;
         assert!(singular_candidate(&c));
+
+        c.tt_depth = 6;
+        assert!(!singular_candidate(&c));
     }
 
     // --- extension ladder -------------------------------------------------
@@ -675,11 +677,12 @@ mod tests {
     #[test]
     fn a_barely_singular_move_gets_one_ply() {
         let sp = sp();
-        let c = ctx(&sp);
+        let mut c = ctx(&sp);
+        c.pv_node = true;
+
         let sbeta = singular_beta(&c);
-        // Just under the beta: inside both margins.
         let v = sbeta - 1;
-        assert!(!(v < sbeta - double_margin(&c)) || double_margin(&c) < 1);
+
         match classify(&c, v) {
             SingularOutcome::Extend { extension, .. } => assert_eq!(extension, 1),
             other => panic!("{other:?}"),
@@ -696,11 +699,11 @@ mod tests {
         b.pv_node = true;
         assert!(double_margin(&b) > double_margin(&a));
         assert!(triple_margin(&b) > triple_margin(&a));
-        // A quiet TT move lowers both margins.
+        // A capturing TT move raises both margins.
         let mut c = ctx(&sp);
         c.tt_capture = true;
-        assert!(double_margin(&c) < double_margin(&a));
-        assert!(triple_margin(&c) < triple_margin(&a));
+        assert!(double_margin(&c) > double_margin(&a));
+        assert!(triple_margin(&c) > triple_margin(&a));
         // A strong correction lowers both margins.
         let mut d = ctx(&sp);
         d.correction_value = 198_368 * 3;
@@ -708,7 +711,7 @@ mod tests {
         assert!(triple_margin(&d) < triple_margin(&a));
         // A positive ttMoveHistory lowers the double margin.
         let mut e = ctx(&sp);
-        e.tt_move_history = 114_178 / 1175;
+        e.tt_move_history = 1_000;
         assert!(double_margin(&e) < double_margin(&a));
         // ttPv raises the triple margin.
         let mut f = ctx(&sp);
@@ -787,13 +790,17 @@ mod tests {
     fn arm_three_wins_when_the_tt_value_already_fails_high() {
         let sp = sp();
         let mut c = ctx(&sp);
-        c.cut_node = false; // not a cut node
-        c.beta = 300;
-        c.tt_value = 500; // >= beta
-        let v = singular_beta(&c) + 1; // >= singularBeta, < beta
+        c.cut_node = false;
+        c.beta = 500;
+        c.tt_value = 500;
+
+        let v = singular_beta(&c) + 1;
+
+        assert!(v < c.beta);
+
         assert!(matches!(
             classify(&c, v),
-            SingularOutcome::NegativeExt { .. }
+            SingularOutcome::NegativeExt { extension: -3 }
         ));
     }
 

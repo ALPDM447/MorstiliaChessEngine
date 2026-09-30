@@ -492,19 +492,21 @@ mod tests {
     fn positions_inside_the_noise_floor_become_draws() {
         // The noise floor is a third of `max_score_cp`; a 40 cp opinion with a
         // 1500 cp ceiling sits well inside it.
-        let pos = Position::from_fen(MID).unwrap();
-        let cfg = TeacherConfig {
-            depth: 6,
-            max_score_cp: 120,
-            fold_decisive: true,
-            ..TeacherConfig::default()
-        };
+        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",).unwrap();
+
+    let cfg = TeacherConfig {
+        depth: 6,
+        max_score_cp: 120,
+        fold_decisive: true,
+        ..TeacherConfig::default()
+    };
         let mut t = Teacher::new(&cfg, None, None).unwrap();
         let l = t.label(&pos);
-        // With a 120 cp ceiling anything under 40 cp folds to a draw, and a
-        // shallow search on a balanced position is exactly that.
+        // With a 120 cp ceiling anything under 40 cp folds to a draw.
+        // The symmetric start position is used so this test does not depend on
+        // a particular middlegame evaluation remaining inside the noise floor.
         assert_eq!(l.label, Label::Draw, "got {l:?}");
-        assert!(l.score.abs() < 40 || l.score.abs() > 200);
+        assert!(l.score.abs() < 40, "score {} escaped the noise floor", l.score);
     }
 
     #[test]
